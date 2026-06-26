@@ -55,6 +55,8 @@ class EoH:
                  use_e2_operator: bool = True,
                  use_m1_operator: bool = True,
                  use_m2_operator: bool = True,
+                 use_adj_prev_operator: bool = False,
+                 use_adj_next_operator: bool = False,
                  num_samplers: int = 1,
                  num_evaluators: int = 1,
                  *,
@@ -94,6 +96,8 @@ class EoH:
         self._use_e2_operator = use_e2_operator
         self._use_m1_operator = use_m1_operator
         self._use_m2_operator = use_m2_operator
+        self._use_adj_prev_operator = use_adj_prev_operator
+        self._use_adj_next_operator = use_adj_next_operator
 
         # samplers and evaluators
         self._num_samplers = num_samplers
@@ -144,8 +148,16 @@ class EoH:
         self.method_name = evaluation.method_name
         self.method_usage = kwargs.get("method_usage", None)
         self.method_introduction = kwargs.get("method_introduction", None)
+        self.main_stream = kwargs.get("main_stream", None)
+        self.prev_method_name = kwargs.get("prev_method_name", None)
+        self.prev_method_code = kwargs.get("prev_method_code", None)
+        self.prev_method_thought = kwargs.get("prev_method_thought", None)
+        self.next_method_name = kwargs.get("next_method_name", None)
+        self.next_method_code = kwargs.get("next_method_code", None)
+        self.next_method_thought = kwargs.get("next_method_thought", None)
         self._sample_score_history = []
         self._sample_order_history = []
+        self._used_operator_history = []
         
     def _adjust_pop_size(self):
         # adjust population size
@@ -200,6 +212,7 @@ class EoH:
         func.algorithm = thought
         func.sample_time = sample_time
         func.operator = operator
+        self._used_operator_history.append(operator)
         if score is not None and not math.isinf(score) and score <= 0:
             self._sample_order_history.append(self._tot_sample_nums + 1)
             self._sample_score_history.append(score)
@@ -258,7 +271,8 @@ class EoH:
                 # get a new func using e1
                 indivs = [self._population.selection() for _ in range(self._selection_num)]
                 prompt = EoHPrompt.get_prompt_e1(self._task_description_str, indivs, self._function_to_evolve, 
-                                                 self.method_name, self.method_usage, self.method_introduction)
+                                                 self.method_name, self.method_usage, self.method_introduction,
+                                                 self.main_stream)
                 if self._debug_mode:
                     print(f'E1 Prompt: {prompt}')
                 self._sample_evaluate_register(prompt, 'e1')
@@ -269,7 +283,8 @@ class EoH:
                 if self._use_e2_operator:
                     indivs = [self._population.selection() for _ in range(self._selection_num)]
                     prompt = EoHPrompt.get_prompt_e2(self._task_description_str, indivs, self._function_to_evolve, 
-                                                     self.method_name, self.method_usage, self.method_introduction)
+                                                     self.method_name, self.method_usage, self.method_introduction,
+                                                     self.main_stream)
                     if self._debug_mode:
                         print(f'E2 Prompt: {prompt}')
                     self._sample_evaluate_register(prompt, 'e2')
@@ -280,7 +295,8 @@ class EoH:
                 if self._use_m1_operator:
                     indiv = self._population.selection()
                     prompt = EoHPrompt.get_prompt_m1(self._task_description_str, indiv, self._function_to_evolve, 
-                                                     self.method_name, self.method_usage, self.method_introduction)
+                                                     self.method_name, self.method_usage, self.method_introduction,
+                                                     self.main_stream)
                     if self._debug_mode:
                         print(f'M1 Prompt: {prompt}')
                     self._sample_evaluate_register(prompt, 'm1')
@@ -291,10 +307,51 @@ class EoH:
                 if self._use_m2_operator:
                     indiv = self._population.selection()
                     prompt = EoHPrompt.get_prompt_m2(self._task_description_str, indiv, self._function_to_evolve, 
-                                                     self.method_name, self.method_usage,self.method_introduction)
+                                                     self.method_name, self.method_usage, self.method_introduction,
+                                                     self.main_stream)
                     if self._debug_mode:
                         print(f'M2 Prompt: {prompt}')
                     self._sample_evaluate_register(prompt, 'm2')
+                    if not self._continue_loop():
+                        break
+
+                if self._use_adj_prev_operator and self.prev_method_name and self.prev_method_code:
+                    indiv = self._population.selection()
+                    prompt = EoHPrompt.get_prompt_adj_prev(
+                        self._task_description_str,
+                        indiv,
+                        self._function_to_evolve,
+                        self.method_name,
+                        self.method_usage,
+                        self.method_introduction,
+                        self.main_stream,
+                        self.prev_method_name,
+                        self.prev_method_code,
+                        self.prev_method_thought,
+                    )
+                    if self._debug_mode:
+                        print(f'AP Prompt: {prompt}')
+                    self._sample_evaluate_register(prompt, 'ap')
+                    if not self._continue_loop():
+                        break
+
+                if self._use_adj_next_operator and self.next_method_name and self.next_method_code:
+                    indiv = self._population.selection()
+                    prompt = EoHPrompt.get_prompt_adj_next(
+                        self._task_description_str,
+                        indiv,
+                        self._function_to_evolve,
+                        self.method_name,
+                        self.method_usage,
+                        self.method_introduction,
+                        self.main_stream,
+                        self.next_method_name,
+                        self.next_method_code,
+                        self.next_method_thought,
+                    )
+                    if self._debug_mode:
+                        print(f'AN Prompt: {prompt}')
+                    self._sample_evaluate_register(prompt, 'an')
                     if not self._continue_loop():
                         break
             except KeyboardInterrupt:
@@ -313,7 +370,8 @@ class EoH:
             try:
                 # get a new func using i1
                 prompt = EoHPrompt.get_prompt_i1(self._task_description_str, self._function_to_evolve, 
-                                                 self.method_name, self.method_usage,self.method_introduction)
+                                                 self.method_name, self.method_usage, self.method_introduction,
+                                                 self.main_stream)
                 self._sample_evaluate_register(prompt, 'i1')
                 if self._tot_sample_nums >= self._initial_sample_nums_max:
                     # print(f'Warning: Initialization not accomplished in {self._initial_sample_nums_max} samples !!!')

@@ -28,6 +28,26 @@ class AlgorithmFrame:
             for name, intro in self.method_introduction.items()
             if name != method_name
         )
+
+    def method_order(self) -> list[str]:
+        # Preserve source order so the inner scheduler can reason about adjacent methods.
+        methods = []
+        tree = ast.parse(self.body)
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == "Algorithm":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name not in {"run", "__init__"}:
+                        methods.append(item.name)
+        return methods
+
+    def method_code(self, method_name: str) -> str:
+        tree = ast.parse(self.body)
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == "Algorithm":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == method_name:
+                        return ast.get_source_segment(self.body, item) or ""
+        return ""
         
     def main_stream(self):
         tree = ast.parse(self.body)
