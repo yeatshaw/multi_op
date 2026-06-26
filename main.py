@@ -562,7 +562,7 @@ class Inner:
                                use_adj_prev_operator=self.use_adj_prev_operator and neighbor_context["prev_method_name"] is not None,
                                use_adj_next_operator=self.use_adj_next_operator and neighbor_context["next_method_name"] is not None,
                                **neighbor_context,
-                               debug_mode=True)
+                               debug_mode=False)
             evolve_frame._max_sample_nums = method_budget
         else:
             evolve_frame = cached_eoh
@@ -981,34 +981,65 @@ def run_inner_only(
     llm: HttpsApi,
     train_instance: list[tuple[np.ndarray, float]],
     test_instance: list[tuple[np.ndarray, float]],
+    train_num_instances: int,
+    train_city_num: int,
+    train_seed: int = 0,
+    max_train_resample_trials: int = 50,
 ) -> AlgorithmFrame:
-    algorithm_frame = text_to_algorithm(response)
-    algorithm_frame.frame_id = "inner_only_frame"
-    inner = Inner(
-        llm=llm,
-        train_instance=train_instance,
-        test_instance=test_instance,
-        algorithm_frame=algorithm_frame,
-        eoh_log_root="experiment1",
-        max_sample_nums=1000,
-        pop_size=5,
-        budget_mode="adaptive",
-        benefit_mode="absolute_gain",
-        method_selection_mode="greedy",
-        per_call_budget_cap=50,
-        discount_factor=0.8,
-        softmax_temperature=1.0,
-        use_adj_prev_operator=False,
-        use_adj_next_operator=False,
+    for offset in range(max_train_resample_trials):
+        # If the fixed response cannot get a valid baseline score on the sampled
+        # training set, resample the training instances before starting inner EoH.
+        if offset > 0:
+            train_instance = build_random_train_instances(
+                train_num_instances,
+                train_city_num,
+                seed=train_seed + offset,
+            )
+        algorithm_frame = text_to_algorithm(response)
+        algorithm_frame.frame_id = "inner_only_frame"
+        inner = Inner(
+            llm=llm,
+            train_instance=train_instance,
+            test_instance=test_instance,
+            algorithm_frame=algorithm_frame,
+            eoh_log_root="experiment1",
+            max_sample_nums=1000,
+            pop_size=5,
+            budget_mode="adaptive",
+            benefit_mode="absolute_gain",
+            method_selection_mode="greedy",
+            per_call_budget_cap=50,
+            discount_factor=0.8,
+            softmax_temperature=1.0,
+            use_adj_prev_operator=False,
+            use_adj_next_operator=False,
+        )
+        baseline_score = inner._evaluate_frame()
+        if baseline_score is not None:
+            inner.algorithm_frame.score = baseline_score
+            print(
+                f"Initial frame baseline score: {baseline_score} "
+                f"(train_seed={train_seed + offset})",
+                flush=True,
+            )
+            return inner.run()
+        print(
+            f"Initial frame baseline score is None, resample training instances "
+            f"with train_seed={train_seed + offset + 1}.",
+            flush=True,
+        )
+    raise RuntimeError(
+        f"Failed to obtain a valid initial baseline score after "
+        f"{max_train_resample_trials} training-set trials."
     )
-    return inner.run()
     
 def main() -> None:
     mode = "inner_only"
     train_city_num = 100
     train_num_instances = 50
+    train_seed = 0
     test_max_city_num = 100
-    train_instance = build_random_train_instances(train_num_instances, train_city_num, seed=0)
+    train_instance = build_random_train_instances(train_num_instances, train_city_num, seed=train_seed)
     test_instance = build_npz_test_instances(test_max_city_num)
 
     llm = HttpsApi(
@@ -1019,7 +1050,14 @@ def main() -> None:
     )
 
     if mode == "inner_only":
-        run_inner_only(llm, train_instance, test_instance)
+        run_inner_only(
+            llm,
+            train_instance,
+            test_instance,
+            train_num_instances=train_num_instances,
+            train_city_num=train_city_num,
+            train_seed=train_seed,
+        )
         return
 
     outer = Outer(llm=llm, 
