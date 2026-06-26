@@ -178,6 +178,7 @@ def _frame_evaluation_worker(
     timeout_seconds: int,
     result_queue: mp.Queue,
     score_mode: str = "gap",
+    num_workers: int | None = None,
 ) -> None:
     try:
         evaluation = TSPEvaluation(
@@ -185,6 +186,7 @@ def _frame_evaluation_worker(
             algorithm_str=algorithm_body,
             timeout_seconds=timeout_seconds,
             score_mode=score_mode,
+            num_workers=num_workers,
         )
         result_queue.put({"score": evaluation.evaluate_program()})
     except Exception:
@@ -322,7 +324,8 @@ class Inner:
                  hybrid_weights: tuple[float, float, float] = (1.0, 0.5, 0.25),
                  recent_window: int = 3,
                  use_adj_prev_operator: bool = True,
-                 use_adj_next_operator: bool = True):
+                 use_adj_next_operator: bool = True,
+                 eval_num_workers: int | None = None):
         self.llm = llm
         self.train_instance = train_instance
         self.test_instance = test_instance or []
@@ -340,6 +343,7 @@ class Inner:
         self.recent_window = recent_window
         self.use_adj_prev_operator = use_adj_prev_operator
         self.use_adj_next_operator = use_adj_next_operator
+        self.eval_num_workers = eval_num_workers
         self.method_order = self.algorithm_frame.method_order()
         self.remaining_budget = max_sample_nums
         self.total_consumed_budget = 0
@@ -381,7 +385,7 @@ class Inner:
         result_queue = mp.Queue()
         process = mp.Process(
             target=_frame_evaluation_worker,
-            args=(instance, algorithm_body, 120, result_queue, score_mode),
+            args=(instance, algorithm_body, 120, result_queue, score_mode, self.eval_num_workers),
         )
         process.start()
         try:
@@ -547,7 +551,8 @@ class Inner:
                                        instance=self.train_instance, 
                                        method_name=cur_method,
                                        algorithm_str=self.algorithm_frame.body,
-                                       score_mode="absolute_distance")
+                                       score_mode="absolute_distance",
+                                       num_workers=self.eval_num_workers)
             evolve_frame = EoH(llm=self.llm,
                                profiler=ProfilerBase(log_dir=frame_log_dir, log_style='complex'),
                                evaluation=evaluation,
@@ -752,7 +757,8 @@ class Outer:
                  outer_max_generations: int,
                  eoh_max_sample_nums: int,
                  eoh_pop_size: int,
-                 timeout_seconds: int = 120):
+                 timeout_seconds: int = 120,
+                 eval_num_workers: int | None = None):
         
         self.llm = llm
         self.instance = instance
@@ -761,6 +767,7 @@ class Outer:
         self.eoh_max_sample_nums = eoh_max_sample_nums
         self.eoh_pop_size = eoh_pop_size
         self.timeout_seconds = timeout_seconds
+        self.eval_num_workers = eval_num_workers
         
         self.population = FramePopulation(pop_size=outer_pop_size)
         self.profiler = FrameProfiler(log_dir="logs_frame_0620")
@@ -777,7 +784,14 @@ class Outer:
         result_queue = mp.Queue()
         process = mp.Process(
             target=_frame_evaluation_worker,
-            args=(self.instance, algorithm_frame.body, self.timeout_seconds, result_queue, "gap"),
+            args=(
+                self.instance,
+                algorithm_frame.body,
+                self.timeout_seconds,
+                result_queue,
+                "gap",
+                self.eval_num_workers,
+            ),
         )
         process.start()
         try:
@@ -881,7 +895,8 @@ class Outer:
         for indiv in self.population.init_population:
             inner = Inner(llm=self.llm, train_instance=self.instance, test_instance=None, algorithm_frame=indiv,
                           eoh_log_root=self.eoh_log_root,
-                          max_sample_nums=self.eoh_max_sample_nums, pop_size=self.eoh_pop_size)
+                          max_sample_nums=self.eoh_max_sample_nums, pop_size=self.eoh_pop_size,
+                          eval_num_workers=self.eval_num_workers)
             inner.run()
             if _is_valid_outer_score(inner.algorithm_frame.score):
                 self.population.register_frame(inner.algorithm_frame)
@@ -985,6 +1000,7 @@ def run_inner_only(
     train_city_num: int,
     train_seed: int = 0,
     max_train_resample_trials: int = 50,
+    eval_num_workers: int | None = None,
 ) -> AlgorithmFrame:
     for offset in range(max_train_resample_trials):
         # If the fixed response cannot get a valid baseline score on the sampled
@@ -1013,6 +1029,7 @@ def run_inner_only(
             softmax_temperature=1.0,
             use_adj_prev_operator=False,
             use_adj_next_operator=False,
+            eval_num_workers=eval_num_workers,
         )
         baseline_score = inner._evaluate_frame()
         if baseline_score is not None:
@@ -1039,6 +1056,7 @@ def main() -> None:
     train_num_instances = 50
     train_seed = 0
     test_max_city_num = 100
+    eval_num_workers = 10
     train_instance = build_random_train_instances(train_num_instances, train_city_num, seed=train_seed)
     test_instance = build_npz_test_instances(test_max_city_num)
 
@@ -1057,6 +1075,7 @@ def main() -> None:
             train_num_instances=train_num_instances,
             train_city_num=train_city_num,
             train_seed=train_seed,
+            eval_num_workers=eval_num_workers,
         )
         return
 
@@ -1065,7 +1084,8 @@ def main() -> None:
                   outer_pop_size=5, 
                   outer_max_generations=10,
                   eoh_max_sample_nums=100,
-                  eoh_pop_size=10)
+                  eoh_pop_size=10,
+                  eval_num_workers=eval_num_workers)
     outer.run()
 if __name__ == "__main__":
     main()

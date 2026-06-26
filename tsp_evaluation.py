@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import os
 import numpy as np
 import types
 import multiprocessing as mp
@@ -42,12 +43,14 @@ class TSPEvaluation(Evaluation):
         self.method_name = kwargs.get("method_name", None)
         self.algorithm_str = kwargs.get("algorithm_str", None)
         self.score_mode = kwargs.get("score_mode", "gap")
+        self.num_workers = kwargs.get("num_workers", None)
         
     def evaluate_program(self, program_str: str = None, callable_func: callable = None) -> Any | None:
         return self.evaluate(program_str)
 
     def evaluate(self, program_str: str) -> Any | None:
-        pool = mp.Pool(processes=len(self.instance))
+        worker_count = self._resolve_num_workers()
+        pool = mp.Pool(processes=worker_count)
         try:
             results = pool.starmap_async(
                 self.core,
@@ -66,6 +69,15 @@ class TSPEvaluation(Evaluation):
         finally:
             pool.join()
         return -np.mean(results)
+
+    def _resolve_num_workers(self) -> int:
+        if not self.instance:
+            return 1
+        max_workers = len(self.instance)
+        if self.num_workers is None:
+            cpu_count = os.cpu_count() or 1
+            return max(1, min(max_workers, cpu_count))
+        return max(1, min(int(self.num_workers), max_workers))
     
     def core(self, instance, random_seed, program_str: str) -> Any | None:
         np.random.seed(random_seed)
