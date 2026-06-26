@@ -1,4 +1,4 @@
-response1 = '''
+response = '''
 Code:
 ```python
 import numpy as np
@@ -156,62 +156,75 @@ Class_args:
 - max_2opt_passes: int, Maximum number of full 2-opt improvement passes per tour.
 '''
 
-response='''
+response1='''
 ```python
 Code:
 {
 import numpy as np
-from itertools import permutations
+import random
 
 class Algorithm:
     def __init__(self, **kwargs):
         self.city_num = kwargs['city_num']
-        self.evaluate_tour = kwargs['tour_evaluation_function']
-        self.best_tour = None
-        self.best_distance = float('inf')
-
+        self.tour_evaluation_function = kwargs['tour_evaluation_function']
+        
     def run(self, **kwargs):
         distance_matrix = kwargs['distance_matrix']
-        self._find_best_tour(distance_matrix)
-        return self.best_tour
+        initial_tour = self.generate_initial_tour()
+        best_tour = initial_tour
+        best_distance = self.tour_evaluation_function(best_tour, distance_matrix)
 
-    def _find_best_tour(self, distance_matrix):
-        for tour in permutations(range(self.city_num)):
-            current_distance = self.evaluate_tour(tour, distance_matrix)
-            self._update_best_tour(tour, current_distance)
-
-    def _update_best_tour(self, tour, current_distance):
-        if current_distance < self.best_distance:
-            self.best_distance = current_distance
-            self.best_tour = tour
-
+        for _ in range(1000):  # Example iteration limit
+            new_tour = self.local_search(best_tour)
+            new_distance = self.tour_evaluation_function(new_tour, distance_matrix)
+            if new_distance < best_distance:
+                best_tour = new_tour
+                best_distance = new_distance
+        
+        return best_tour
+    
+    def generate_initial_tour(self):
+        tour = list(range(self.city_num))
+        random.shuffle(tour)
+        return tour
+    
+    def local_search(self, current_tour):
+        best_tour = current_tour[:]
+        for i in range(len(current_tour) - 1):
+            for j in range(i + 1, len(current_tour)):
+                new_tour = best_tour[:]
+                new_tour[i:j+1] = reversed(best_tour[i:j+1])
+                if self.tour_evaluation_function(new_tour, np.zeros((self.city_num, self.city_num))) < self.tour_evaluation_function(best_tour, np.zeros((self.city_num, self.city_num))):
+                    best_tour = new_tour
+        return best_tour
 }
 ```
 
 method:
 {
-- run: this method is used to run the algorithm, finding the best tour by calling the method to find the best tour given the distance matrix.
-- _find_best_tour: this method is used to generate all permutations of city tours and calculates the distances for each tour, updating the best tour if a shorter one is found.
-- _update_best_tour: this method is used to compare the current tour distance with the best known distance and update the best tour and distance if the current one is shorter.
+- run: this method is used to execute the main algorithm, generating an initial tour and applying a local search to find the best tour.
+- generate_initial_tour: this method is used to create a random initial visiting order of the cities.
+- local_search: this method is used to improve the current tour by checking for better arrangements through pairwise swaps.
 }
 
 Class_args:
 {
-- city_num: int, The number of cities in the TSP instance.
-- evaluate_tour: callable, A function that evaluates the total length of a given tour.
-- best_tour: tuple, The best visiting order of cities found so far.
-- best_distance: float, The length of the best tour found so far, initialized to infinity.
+- city_num: int, the number of cities in the TSP instance.
+- tour_evaluation_function: callable, a function that evaluates the total length of a given tour based on the distance matrix.
 }
 
 method_args:
 {    
-    _find_best_tour:
+    generate_initial_tour:
         Arg:
-            - distance_matrix: np.ndarray, The pairwise city distance matrix used to evaluate tour distances.
-        
-    _update_best_tour:
+            - None: Generates a random initial tour.
+        Return:
+            - tour: list[int], a randomly shuffled list representing the order of cities.
+
+    local_search:
         Arg:
-            - tour: tuple, The current permutation of city indices representing a tour.
-            - current_distance: float, The total distance of the current tour being evaluated.
+            - current_tour: list[int], the currently known best visiting order of cities.
+        Return:
+            - best_tour: list[int], a potentially improved visiting order of cities after local search.
 }
 '''

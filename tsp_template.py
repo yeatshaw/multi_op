@@ -10,7 +10,8 @@ In the '__init__' method, the Algorithm class can only read the following values
             tour: list[int], the visiting order of cities, where the first city is the starting city.
             distance_matrix: np.ndarray in the shape of (city_num, city_num), the pairwise city distance matrix.
         Return:
-            total_distance: float, the total tour length.}
+            total_distance: float, the total tour length.
+        The only valid call form is: self.tour_evaluation_function(tour, distance_matrix)}
 In the 'run' method, the Algorithm class can only read the following values from kwargs:
     {kwargs:
       - distance_matrix: np.ndarray in the shape of (city_num, city_num), the pairwise city distance matrix.}

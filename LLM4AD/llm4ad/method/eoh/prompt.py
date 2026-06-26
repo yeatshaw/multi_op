@@ -25,7 +25,7 @@ class EoHPrompt:
         temp_func = copy.deepcopy(template_function)
         temp_func.body = ''
         # create prompt content
-        prompt_content = f'''{task_prompt} You need to implement the method {method_name} within it. {method_usage}
+        prompt_content = f'''{task_prompt} You need to implement the method '{method_name}' within it, {method_usage}
 1. First, describe your new algorithm and main steps in one sentence. The description must be inside within boxed {{}}. 
 2. Next, implement the following Python function:
 {str(temp_func)}
@@ -45,7 +45,7 @@ Do not give additional explanations.'''
             indi.docstring = ''
             indivs_prompt += f'No. {i + 1} algorithm and the corresponding code are:\n{indi.algorithm}\n{str(indi)}'
         # create prmpt content
-        prompt_content = f'''{task_prompt} You need to implement the method {method_name} within it. {method_usage}
+        prompt_content = f'''{task_prompt} You need to implement the method '{method_name}' within it, {method_usage}
 I have {len(indivs)} existing algorithms with their codes as follows:
 {indivs_prompt}
 Please help me create a new algorithm that has a totally different form from the given ones. 
@@ -69,7 +69,7 @@ Do not give additional explanations.'''
             indi.docstring = ''
             indivs_prompt += f'No. {i + 1} algorithm and the corresponding code are:\n{indi.algorithm}\n{str(indi)}'
         # create prmpt content
-        prompt_content = f'''{task_prompt} You need to implement the method {method_name} within it. {method_usage}
+        prompt_content = f'''{task_prompt} You need to implement the method '{method_name}' within it, {method_usage}
 I have {len(indivs)} existing algorithms with their codes as follows:
 {indivs_prompt}
 Please help me create a new algorithm that has a totally different form from the given ones but can be motivated from them.
@@ -88,7 +88,7 @@ Do not give additional explanations.'''
         temp_func.body = ''
 
         # create prmpt content
-        prompt_content = f'''{task_prompt} You need to implement the method {method_name} within it. {method_usage}
+        prompt_content = f'''{task_prompt} You need to implement the method '{method_name}' within it, {method_usage}
 I have one algorithm with its code as follows. Algorithm description:
 {indi.algorithm}
 Code:
@@ -107,7 +107,7 @@ Do not give additional explanations.'''
         temp_func = copy.deepcopy(template_function)
         temp_func.body = ''
         # create prmpt content
-        prompt_content = f'''{task_prompt} You need to implement the method {method_name} within it. {method_usage}
+        prompt_content = f'''{task_prompt} You need to implement the method '{method_name}' within it, {method_usage}
 The process of the other methods is introduced as follows: {method_introduction}.
 {indi.algorithm}
 Code:
@@ -119,5 +119,5 @@ Please identify the main algorithm parameters and assist me in creating a new al
 Do not give additional explanations.'''
         return prompt_content
 
-"""You need to implement the method {method_name} within it.
+"""You need to implement the method '{method_name}' within it.
 The process of the other methods is introduced as follows: {method_introduction}."""

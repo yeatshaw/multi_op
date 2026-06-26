@@ -8,7 +8,7 @@ import numpy as np
 
 @dataclass
 class AlgorithmFrame:
-    score: float
+    score: float | None
     body: str
     class_args: list[str]
     method_args: dict[str, str]
@@ -129,12 +129,12 @@ def load_tsp_dictionaries(
 def text_to_algorithm(response) -> AlgorithmFrame:
     response_text = getattr(response, "text", response)
     body = _extract_code(response_text)
-    class_args_text = _extract_braced_section(response_text, "Class_args")
-    method_args_text = _extract_braced_section(response_text, "method_args")
-    method_text = _extract_braced_section(response_text, "method")
+    class_args_text = _extract_section(response_text, "Class_args", "method_args")
+    method_args_text = _extract_section(response_text, "method_args")
+    method_text = _extract_section(response_text, "method", "Class_args")
     valid_methods = _extract_evolvable_methods(body)
     return AlgorithmFrame(
-        score=float("-inf"),
+        score=None,
         body=body,
         class_args=_split_non_empty_lines(class_args_text),
         method_args=_extract_method_args(method_args_text, valid_methods),
@@ -189,30 +189,55 @@ def build_template_program(parsed: AlgorithmFrame, method_name: str) -> str:
 
 
 def _extract_code(response_text: str) -> str:
-    # The current prompt always puts `Code:` inside a python fence and wraps the body in braces.
-    match = re.search(r"```(?:python)?\s*Code:\s*(.*?)```", response_text, flags=re.DOTALL)
-    if match:
-        content = _strip_wrapping_braces(match.group(1))
+    # Slice by semantic labels instead of fenced blocks because the model often forgets to
+    # close ```python before emitting `method:` / `Class_args:`.
+    content = _extract_section(response_text, "Code", "method")
+    if content:
+        content = _strip_code_fence_markers(_strip_wrapping_braces(content))
         if "class Algorithm:" in content:
             return "\n".join(line.rstrip() for line in content.splitlines() if line.strip())
     return ""
 
 
-def _extract_braced_section(response_text: str, label: str) -> str:
-    match = re.search(rf"{re.escape(label)}:\s*\{{(.*?)\}}", response_text, flags=re.DOTALL)
-    if not match:
+def _extract_section(response_text: str, label: str, next_label: str | None = None) -> str:
+    start_match = re.search(rf"{re.escape(label)}:\s*", response_text)
+    if not start_match:
         return ""
-    return textwrap.dedent(match.group(1)).strip()
+
+    start = start_match.end()
+    end = len(response_text)
+    if next_label:
+        end_match = re.search(rf"\n\s*{re.escape(next_label)}:\s*", response_text[start:])
+        if end_match:
+            end = start + end_match.start()
+
+    content = response_text[start:end].strip()
+    return textwrap.dedent(_strip_code_fence_markers(_strip_wrapping_braces(content))).strip()
 
 
 def _extract_method_args(method_args_text: str, valid_methods: set[str] | None = None) -> dict[str, str]:
     if not method_args_text:
         return {}
-    parts = re.split(r"\n\s{4}([A-Za-z_]\w*):\s*\n", "\n" + method_args_text.strip("\n"))
-    method_args = {
-        parts[i]: textwrap.dedent(parts[i + 1]).strip()
-        for i in range(1, len(parts), 2)
-    }
+    method_args = {}
+    current_name = None
+    current_lines = []
+    top_level_names = valid_methods or set()
+
+    # Only treat actual method names as block headers; `Arg:` and `Return:` are nested labels.
+    for line in method_args_text.strip().splitlines():
+        match = re.match(r"^\s*([A-Za-z_]\w*):\s*$", line)
+        if match and match.group(1) in top_level_names:
+            if current_name is not None:
+                method_args[current_name] = textwrap.dedent("\n".join(current_lines)).strip()
+            current_name = match.group(1)
+            current_lines = []
+            continue
+        if current_name is not None:
+            current_lines.append(line)
+
+    if current_name is not None:
+        method_args[current_name] = textwrap.dedent("\n".join(current_lines)).strip()
+
     if valid_methods is None:
         return {
             name: info for name, info in method_args.items()
@@ -259,11 +284,24 @@ def _tour_eval_signature_lines() -> list[str]:
 
 def _extract_method_introduction(content: str) -> dict[str, str]:
     result = {}
-    for line in content.splitlines():
-        line = line.strip()
+    current_name = None
+    current_lines = []
+
+    # Merge wrapped bullet lines so multi-line method descriptions stay intact.
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
         match = re.match(r"-\s*'?([A-Za-z_]\w*)'?\s*:\s*(.*)", line)
         if match:
-            result[match.group(1)] = match.group(2).strip()
+            if current_name is not None:
+                result[current_name] = " ".join(current_lines).strip()
+            current_name = match.group(1)
+            current_lines = [match.group(2).strip()]
+            continue
+        if current_name is not None and line:
+            current_lines.append(line)
+
+    if current_name is not None:
+        result[current_name] = " ".join(current_lines).strip()
     return result
 
 
@@ -276,6 +314,15 @@ def _strip_wrapping_braces(content: str) -> str:
     if lines and lines[0].strip() == "{":
         lines = lines[1:]
     if lines and lines[-1].strip() == "}":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _strip_code_fence_markers(content: str) -> str:
+    lines = content.strip().splitlines()
+    if lines and re.match(r"^```(?:python)?\s*$", lines[0].strip(), flags=re.IGNORECASE):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
         lines = lines[:-1]
     return "\n".join(lines).strip()
 

@@ -35,7 +35,6 @@ use_exist = False
 def _is_valid_outer_score(score: float | None) -> bool:
     return score is not None and not math.isinf(score) and score <= 0
 
-
 def _frame_evaluation_worker(
     instance: list[tuple[np.ndarray, float]],
     algorithm_body: str,
@@ -316,6 +315,7 @@ class Outer:
                 return
             evaluate_start_time = time.time()
             score = self._evaluate_with_timeout(algorithm_frame)
+            score = None if math.isinf(score) else score
             evaluate_time = time.time() - evaluate_start_time
             self._fill_frame_metadata(
                 algorithm_frame, score, sample_time, evaluate_time, operator
@@ -355,6 +355,8 @@ class Outer:
     
     def iteratively_init_population(self):
         while self.population.generation == 0 and len(self.population.init_population) < self.population.pop_size:
+            if self.tot_sample_nums == 20:
+                exit("Stop iterative initialization after 20 samples to prevent infinite loop. Please check the logs for details.")
             try:
                 prompt = FramePrompt.get_frame_prompt_i1(task_description=task_description_outer,
                                                          problem_info=problem_info,
@@ -456,7 +458,7 @@ def main() -> None:
     
     outer = Outer(llm=llm, 
                   instance=instance, 
-                  outer_pop_size=20, 
+                  outer_pop_size=5, 
                   outer_max_generations=10,
                   eoh_max_sample_nums=100,
                   eoh_pop_size=10)
