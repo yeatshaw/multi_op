@@ -47,6 +47,7 @@ class MethodStats:
     success_count: int = 0
     last_gain: float = 0.0
     gain_history: list[float] = field(default_factory=list)
+    benefit_history: list[float] = field(default_factory=list)
     used_operators: list[str] = field(default_factory=list)
 
 
@@ -97,6 +98,11 @@ class InnerProfiler:
         self._append_json(self._best_path, {"final_frame": frame.description(), **final_summary})
         self._plot_convergence_curve()
 
+    def record_test_result(self, test_summary: dict):
+        self._append_json(self._best_path, {"test_result": test_summary})
+        self._logger.info("Test score    : %s", test_summary.get("test_score"))
+        self._logger.info("Test instances: %s", test_summary.get("num_test_instances"))
+
     def _append_json(self, path: str, content: dict):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -136,12 +142,14 @@ def _frame_evaluation_worker(
     algorithm_body: str,
     timeout_seconds: int,
     result_queue: mp.Queue,
+    score_mode: str = "gap",
 ) -> None:
     try:
         evaluation = TSPEvaluation(
             instance=instance,
             algorithm_str=algorithm_body,
             timeout_seconds=timeout_seconds,
+            score_mode=score_mode,
         )
         result_queue.put({"score": evaluation.evaluate_program()})
     except Exception:
@@ -264,27 +272,35 @@ class FrameProfiler:
 class Inner:
     def __init__(self,
                  llm: HttpsApi,
-                 instance: list[tuple[np.ndarray, float]],
+                 train_instance: list[tuple[np.ndarray, float]],
+                 test_instance: list[tuple[np.ndarray, float]] | None,
                  algorithm_frame: AlgorithmFrame,
                  eoh_log_root: str,
                  max_sample_nums: int = 20,
                  pop_size: int = 5,
                  budget_mode: str = "average",
                  benefit_mode: str = "absolute_gain",
+                 method_selection_mode: str = "greedy",
                  per_call_budget_cap: int = 50,
+                 discount_factor: float = 0.8,
+                 softmax_temperature: float = 1.0,
                  hybrid_weights: tuple[float, float, float] = (1.0, 0.5, 0.25),
                  recent_window: int = 3,
                  use_adj_prev_operator: bool = True,
                  use_adj_next_operator: bool = True):
         self.llm = llm
-        self.instance = instance
+        self.train_instance = train_instance
+        self.test_instance = test_instance or []
         self.algorithm_frame = algorithm_frame
         self.eoh_log_root = eoh_log_root
         self.max_sample_nums = max_sample_nums
         self.pop_size = pop_size
         self.budget_mode = budget_mode
         self.benefit_mode = benefit_mode
+        self.method_selection_mode = method_selection_mode
         self.per_call_budget_cap = per_call_budget_cap
+        self.discount_factor = discount_factor
+        self.softmax_temperature = softmax_temperature
         self.hybrid_weights = hybrid_weights
         self.recent_window = recent_window
         self.use_adj_prev_operator = use_adj_prev_operator
@@ -313,10 +329,23 @@ class Inner:
         self.algorithm_frame.method_introduction[method_name] = func.algorithm
     
     def _evaluate_frame(self) -> float | None:
+        return self._evaluate_body(self.algorithm_frame.body, self.train_instance, "absolute_distance")
+
+    def _evaluate_test_frame(self) -> float | None:
+        if not self.test_instance:
+            return None
+        return self._evaluate_body(self.algorithm_frame.body, self.test_instance, "gap")
+
+    def _evaluate_body(
+        self,
+        algorithm_body: str,
+        instance: list[tuple[np.ndarray, float]],
+        score_mode: str,
+    ) -> float | None:
         result_queue = mp.Queue()
         process = mp.Process(
             target=_frame_evaluation_worker,
-            args=(self.instance, self.algorithm_frame.body, 120, result_queue),
+            args=(instance, algorithm_body, 120, result_queue, score_mode),
         )
         process.start()
         try:
@@ -352,6 +381,18 @@ class Inner:
             return float("-inf")
         return new_score - old_score
 
+    def _calculate_log_ratio_gain(self, old_score: float | None, new_score: float | None) -> float:
+        # Scores are negative and closer to zero is better, so compare their absolute magnitudes.
+        if old_score is None or new_score is None:
+            return float("-inf")
+        if old_score == 0 or new_score == 0:
+            return float("-inf")
+        old_loss = abs(old_score)
+        new_loss = abs(new_score)
+        if old_loss == 0 or new_loss == 0:
+            return float("-inf")
+        return math.log10(old_loss / new_loss)
+
     def _recent_success_rate(self, method_name: str) -> float:
         gains = self.stats[method_name].gain_history[-self.recent_window:]
         if not gains:
@@ -366,6 +407,15 @@ class Inner:
             return absolute_gain
         if self.benefit_mode == "gain_per_sample":
             return gain_per_sample
+        if self.benefit_mode == "log_last_gain":
+            return stats.benefit_history[-1] if stats.benefit_history else float("-inf")
+        if self.benefit_mode == "log_discounted_gain":
+            if not stats.benefit_history:
+                return float("-inf")
+            total = 0.0
+            for idx, gain in enumerate(reversed(stats.benefit_history)):
+                total += gain * (self.discount_factor ** idx)
+            return total
         w1, w2, w3 = self.hybrid_weights
         return w1 * absolute_gain + w2 * gain_per_sample + w3 * self._recent_success_rate(method_name)
 
@@ -378,12 +428,46 @@ class Inner:
 
     def _select_next_method(self) -> tuple[str | None, dict[str, float]]:
         benefit_map = {method: self._benefit_value(method) for method in self.method_order}
+        if all(value <= 0 for value in benefit_map.values()) and all(self.stats[m].call_count > 0 for m in self.method_order):
+            return None, benefit_map
         candidate = max(benefit_map, key=benefit_map.get, default=None)
         if candidate is None:
             return None, benefit_map
-        if all(value <= 0 for value in benefit_map.values()) and all(self.stats[m].call_count > 0 for m in self.method_order):
-            return None, benefit_map
+        if self.method_selection_mode == "softmax":
+            finite_items = [(method, value) for method, value in benefit_map.items() if not math.isinf(value)]
+            if not finite_items:
+                return candidate, benefit_map
+            methods, values = zip(*finite_items)
+            logits = np.array(values, dtype=float) / max(self.softmax_temperature, 1e-8)
+            logits = logits - np.max(logits)
+            probs = np.exp(logits)
+            probs = probs / np.sum(probs)
+            return str(np.random.choice(methods, p=probs)), benefit_map
         return candidate, benefit_map
+
+    def _update_method_stats(
+        self,
+        method: str,
+        budget: int,
+        score_after: float | None,
+        gain: float,
+        used_operators: list[str],
+        benefit_gain: float | None = None,
+    ) -> None:
+        stats = self.stats[method]
+        stats.call_count += 1
+        stats.used_budget += budget
+        stats.last_score = score_after
+        if score_after is not None:
+            stats.best_score = score_after if stats.best_score is None else max(stats.best_score, score_after)
+        stats.last_gain = gain
+        stats.total_gain += 0 if gain == float("-inf") else gain
+        stats.gain_history.append(gain)
+        if gain > 0:
+            stats.success_count += 1
+        if benefit_gain is not None and not math.isinf(benefit_gain):
+            stats.benefit_history.append(benefit_gain)
+        stats.used_operators.extend(used_operators)
 
     def _record_method_step(
         self,
@@ -421,9 +505,10 @@ class Inner:
         neighbor_context = self._neighbor_context(cur_method)
         evaluation = TSPEvaluation(template_program=cur_template_program,
                                    task_description=task_description_inner,
-                                   instance=self.instance, 
+                                   instance=self.train_instance, 
                                    method_name=cur_method,
-                                   algorithm_str=self.algorithm_frame.body)
+                                   algorithm_str=self.algorithm_frame.body,
+                                   score_mode="absolute_distance")
         evolve_frame = EoH(llm=self.llm,
                            profiler=ProfilerBase(log_dir=frame_log_dir, log_style='complex'),
                            evaluation=evaluation,
@@ -463,25 +548,27 @@ class Inner:
             self.remaining_budget -= budget
             self.total_consumed_budget += budget
             if best_func is None:
-                self.stats[method].call_count += 1
-                self.stats[method].used_budget += budget
-                self.stats[method].used_operators.extend(getattr(evolve_frame, "_used_operator_history", []))
+                self._update_method_stats(
+                    method,
+                    budget,
+                    self.algorithm_frame.score,
+                    float("-inf"),
+                    getattr(evolve_frame, "_used_operator_history", []),
+                )
                 self._record_method_step(method, budget, score_before, self.algorithm_frame.score, float("-inf"), getattr(evolve_frame, "_used_operator_history", []), {})
                 continue
             score_after = self._evaluate_frame()
             self.algorithm_frame.score = score_after
             gain = self._calculate_gain(score_before, score_after)
-            stats = self.stats[method]
-            stats.call_count += 1
-            stats.used_budget += budget
-            stats.last_score = score_after
-            stats.best_score = score_after if stats.best_score is None else max(stats.best_score, score_after)
-            stats.last_gain = gain
-            stats.total_gain += 0 if gain == float("-inf") else gain
-            stats.gain_history.append(gain)
-            if gain > 0:
-                stats.success_count += 1
-            stats.used_operators.extend(getattr(evolve_frame, "_used_operator_history", []))
+            benefit_gain = self._calculate_log_ratio_gain(score_before, score_after) if self.benefit_mode in {"log_last_gain", "log_discounted_gain"} else None
+            self._update_method_stats(
+                method,
+                budget,
+                score_after,
+                gain,
+                getattr(evolve_frame, "_used_operator_history", []),
+                benefit_gain,
+            )
             self._record_method_step(
                 method,
                 budget,
@@ -505,26 +592,23 @@ class Inner:
             best_func, evolve_frame = self.evolve_once(method, template_program, budget)
             self.remaining_budget -= budget
             self.total_consumed_budget += budget
-            stats = self.stats[method]
-            stats.call_count += 1
-            stats.used_budget += budget
-            stats.used_operators.extend(getattr(evolve_frame, "_used_operator_history", []))
             if best_func is not None:
                 score_after = self._evaluate_frame()
                 self.algorithm_frame.score = score_after
                 gain = self._calculate_gain(score_before, score_after)
-                stats.last_score = score_after
-                stats.best_score = score_after if stats.best_score is None else max(stats.best_score, score_after)
-                stats.last_gain = gain
-                stats.total_gain += 0 if gain == float("-inf") else gain
-                stats.gain_history.append(gain)
-                if gain > 0:
-                    stats.success_count += 1
+                benefit_gain = self._calculate_log_ratio_gain(score_before, score_after) if self.benefit_mode in {"log_last_gain", "log_discounted_gain"} else None
             else:
                 score_after = self.algorithm_frame.score
                 gain = float("-inf")
-                stats.last_gain = gain
-                stats.gain_history.append(gain)
+                benefit_gain = None
+            self._update_method_stats(
+                method,
+                budget,
+                score_after,
+                gain,
+                getattr(evolve_frame, "_used_operator_history", []),
+                benefit_gain,
+            )
             self._record_method_step(
                 method,
                 budget,
@@ -545,26 +629,23 @@ class Inner:
             best_func, evolve_frame = self.evolve_once(method, template_program, budget)
             self.remaining_budget -= budget
             self.total_consumed_budget += budget
-            stats = self.stats[method]
-            stats.call_count += 1
-            stats.used_budget += budget
-            stats.used_operators.extend(getattr(evolve_frame, "_used_operator_history", []))
             if best_func is not None:
                 score_after = self._evaluate_frame()
                 self.algorithm_frame.score = score_after
                 gain = self._calculate_gain(score_before, score_after)
-                stats.last_score = score_after
-                stats.best_score = score_after if stats.best_score is None else max(stats.best_score, score_after)
-                stats.last_gain = gain
-                stats.total_gain += 0 if gain == float("-inf") else gain
-                stats.gain_history.append(gain)
-                if gain > 0:
-                    stats.success_count += 1
+                benefit_gain = self._calculate_log_ratio_gain(score_before, score_after) if self.benefit_mode in {"log_last_gain", "log_discounted_gain"} else None
             else:
                 score_after = self.algorithm_frame.score
                 gain = float("-inf")
-                stats.last_gain = gain
-                stats.gain_history.append(gain)
+                benefit_gain = None
+            self._update_method_stats(
+                method,
+                budget,
+                score_after,
+                gain,
+                getattr(evolve_frame, "_used_operator_history", []),
+                benefit_gain,
+            )
             self._record_method_step(
                 method,
                 budget,
@@ -580,12 +661,21 @@ class Inner:
             self._run_average_schedule()
         else:
             self._run_adaptive_schedule()
+        test_score = self._evaluate_test_frame()
+        if test_score is not None:
+            self.profiler.record_test_result(
+                {
+                    "test_score": test_score,
+                    "num_test_instances": len(self.test_instance),
+                }
+            )
         self.profiler.finish(
             self.algorithm_frame,
             {
                 "final_score": self.algorithm_frame.score,
                 "remaining_budget": self.remaining_budget,
                 "total_consumed_budget": self.total_consumed_budget,
+                "test_score": test_score,
             },
         )
         return self.algorithm_frame
@@ -623,7 +713,7 @@ class Outer:
         result_queue = mp.Queue()
         process = mp.Process(
             target=_frame_evaluation_worker,
-            args=(self.instance, algorithm_frame.body, self.timeout_seconds, result_queue),
+            args=(self.instance, algorithm_frame.body, self.timeout_seconds, result_queue, "gap"),
         )
         process.start()
         try:
@@ -725,7 +815,7 @@ class Outer:
         
     def inner_evolve(self):
         for indiv in self.population.init_population:
-            inner = Inner(llm=self.llm, instance=self.instance, algorithm_frame=indiv,
+            inner = Inner(llm=self.llm, train_instance=self.instance, test_instance=None, algorithm_frame=indiv,
                           eoh_log_root=self.eoh_log_root,
                           max_sample_nums=self.eoh_max_sample_nums, pop_size=self.eoh_pop_size)
             inner.run()
@@ -793,33 +883,69 @@ class Outer:
         self.profiler.finish()
 
 
-def run_inner_only(llm: HttpsApi, instance: list[tuple[np.ndarray, float]]) -> AlgorithmFrame:
+def _coords_to_distance_matrix(coords: np.ndarray) -> np.ndarray:
+    diff = coords[:, None, :] - coords[None, :, :]
+    return np.linalg.norm(diff, axis=-1)
+
+
+def build_random_train_instances(
+    num_instances: int,
+    city_num: int,
+    seed: int = 0,
+) -> list[tuple[np.ndarray, float]]:
+    rng = np.random.default_rng(seed)
+    instances = []
+    for _ in range(num_instances):
+        coords = rng.uniform(0.0, 1.0, size=(city_num, 2))
+        distance_matrix = _coords_to_distance_matrix(coords)
+        instances.append((distance_matrix, 0.0))
+    return instances
+
+
+def build_npz_test_instances(max_city_num: int) -> list[tuple[np.ndarray, float]]:
+    distance_matrix_dict, _ = load_tsp_dictionaries()
+    instances = []
+    for distance_matrix, optimum_distance in distance_matrix_dict.values():
+        if optimum_distance is None:
+            continue
+        if distance_matrix.shape[0] <= max_city_num:
+            instances.append((distance_matrix, float(optimum_distance)))
+    return instances
+
+
+def run_inner_only(
+    llm: HttpsApi,
+    train_instance: list[tuple[np.ndarray, float]],
+    test_instance: list[tuple[np.ndarray, float]],
+) -> AlgorithmFrame:
     algorithm_frame = text_to_algorithm(response)
     algorithm_frame.frame_id = "inner_only_frame"
     inner = Inner(
         llm=llm,
-        instance=instance,
+        train_instance=train_instance,
+        test_instance=test_instance,
         algorithm_frame=algorithm_frame,
         eoh_log_root="experiment1",
         max_sample_nums=1000,
         pop_size=10,
         budget_mode="average",
         benefit_mode="absolute_gain",
+        method_selection_mode="greedy",
         per_call_budget_cap=50,
-        use_adj_prev_operator=True,
-        use_adj_next_operator=True,
+        discount_factor=0.8,
+        softmax_temperature=1.0,
+        use_adj_prev_operator=False,
+        use_adj_next_operator=False,
     )
     return inner.run()
     
 def main() -> None:
     mode = "inner_only"
-    problem_size = 100
-    instance = []
-    distance_matrix_dict, _ = load_tsp_dictionaries()
-    #instance.append(distance_matrix_dict['bays29'])
-    for value in distance_matrix_dict.values():
-        if value[0].shape[0] <= problem_size:
-            instance.append(value)
+    train_city_num = 100
+    train_num_instances = 50
+    test_max_city_num = 100
+    train_instance = build_random_train_instances(train_num_instances, train_city_num, seed=0)
+    test_instance = build_npz_test_instances(test_max_city_num)
 
     llm = HttpsApi(
         host="yunwu.ai",
@@ -829,11 +955,11 @@ def main() -> None:
     )
 
     if mode == "inner_only":
-        run_inner_only(llm, instance)
+        run_inner_only(llm, train_instance, test_instance)
         return
 
     outer = Outer(llm=llm, 
-                  instance=instance, 
+                  instance=test_instance, 
                   outer_pop_size=5, 
                   outer_max_generations=10,
                   eoh_max_sample_nums=100,

@@ -41,6 +41,7 @@ class TSPEvaluation(Evaluation):
         self.instance = kwargs.get("instance", None)
         self.method_name = kwargs.get("method_name", None)
         self.algorithm_str = kwargs.get("algorithm_str", None)
+        self.score_mode = kwargs.get("score_mode", "gap")
         
     def evaluate_program(self, program_str: str = None, callable_func: callable = None) -> Any | None:
         return self.evaluate(program_str)
@@ -83,4 +84,6 @@ class TSPEvaluation(Evaluation):
             
         tour = algorithm.run(distance_matrix=distance_matrix)
         distance = evaluate_tour(tour, distance_matrix)
+        if self.score_mode == "absolute_distance":
+            return distance
         return (distance - optimum_distance)/optimum_distance
