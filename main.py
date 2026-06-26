@@ -26,6 +26,7 @@ from tsp_template import *
 from tsp_response import *
 from tsp_evaluation import TSPEvaluation
 from frame_prompt import *
+from LLM4AD.llm4ad.base.code import TextFunctionProgramConverter
 from LLM4AD.llm4ad.tools.llm.llm_api_https import HttpsApi
 from LLM4AD.llm4ad.tools.profiler import ProfilerBase
 from LLM4AD.llm4ad.method.eoh import EoH

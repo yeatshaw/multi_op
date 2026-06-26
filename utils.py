@@ -138,7 +138,7 @@ class FramePopulation:
         return np.random.choice(al, p=p)
 
 def load_tsp_dictionaries(
-    input_file: Path = Path("/public/home/liuyang/multi_op/tsp_instances.npz"),
+    input_file: Path = Path(__file__).resolve().parent / "tsp_instances.npz",
 ) -> tuple[dict[str, tuple[np.ndarray, int]], dict[str, tuple[np.ndarray, int]]]:
     with np.load(input_file, allow_pickle=True) as data:
         distance_matrix_dict = data["distance_matrix_dict"].item()
