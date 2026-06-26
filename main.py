@@ -49,6 +49,7 @@ class MethodStats:
     gain_history: list[float] = field(default_factory=list)
     benefit_history: list[float] = field(default_factory=list)
     used_operators: list[str] = field(default_factory=list)
+    total_sample_calls: int = 0
 
 
 class InnerProfiler:
@@ -61,6 +62,8 @@ class InnerProfiler:
         self._best_path = os.path.join(self._log_dir, "method_best.json")
         self._sample_order_history = []
         self._score_history = []
+        self._method_histories: dict[str, dict[str, list[float]]] = {}
+        self._method_boundaries: dict[str, list[tuple[int, int]]] = {}
         self._best_score = float("-inf")
         self._logger = logging.getLogger(f"inner_profiler_{id(self)}")
         self._logger.setLevel(logging.INFO)
@@ -87,9 +90,23 @@ class InnerProfiler:
         self._logger.info("Remaining      : %s", content["remaining_budget"])
         self._logger.info("======================================================")
         score_after = content["score_after"]
+        method_name = content["method_name"]
+        budget = content["budget"]
+        consumed_total = content["consumed_budget_total"]
+        if method_name not in self._method_histories:
+            self._method_histories[method_name] = {"x": [], "y": []}
+            self._method_boundaries[method_name] = []
+        if budget > 0:
+            start_x = consumed_total - budget + 1
+            end_x = consumed_total
+            self._method_boundaries[method_name].append((start_x, end_x))
         if _is_valid_outer_score(score_after):
             self._sample_order_history.append(content["consumed_budget_total"])
             self._score_history.append(score_after)
+            method_history = self._method_histories[method_name]
+            history_best = max(method_history["y"][-1], score_after) if method_history["y"] else score_after
+            method_history["x"].append(consumed_total)
+            method_history["y"].append(history_best)
             if score_after > self._best_score:
                 self._best_score = score_after
                 self._append_json(self._best_path, content)
@@ -114,26 +131,43 @@ class InnerProfiler:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
     def _plot_convergence_curve(self):
-        if not self._score_history:
-            return
         try:
             import matplotlib.pyplot as plt
 
-            best_so_far = []
-            current_best = float("-inf")
-            for score in self._score_history:
-                current_best = max(current_best, score)
-                best_so_far.append(current_best)
+            if self._score_history:
+                best_so_far = []
+                current_best = float("-inf")
+                for score in self._score_history:
+                    current_best = max(current_best, score)
+                    best_so_far.append(current_best)
 
-            plt.figure(figsize=(8, 5))
-            plt.plot(self._sample_order_history, best_so_far, marker="o")
-            plt.xlabel("Consumed Inner Samples")
-            plt.ylabel("Best Frame Score So Far")
-            plt.title("Inner-Only Best Score Curve")
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.savefig(os.path.join(self._log_dir, "convergence_inner.png"), dpi=150)
-            plt.close()
+                plt.figure(figsize=(8, 5))
+                plt.plot(self._sample_order_history, best_so_far, marker="o")
+                plt.xlabel("Consumed Inner Samples")
+                plt.ylabel("Best Frame Score So Far")
+                plt.title("Inner-Only Best Score Curve")
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(os.path.join(self._log_dir, "convergence_inner.png"), dpi=150)
+                plt.close()
+
+            for method_name, history in self._method_histories.items():
+                if not history["x"]:
+                    continue
+                plt.figure(figsize=(8, 5))
+                plt.plot(history["x"], history["y"], marker="o", label=method_name)
+                for start_x, _ in self._method_boundaries.get(method_name, []):
+                    plt.axvline(start_x, linestyle="--", color="gray", alpha=0.35)
+                plt.xlabel("Consumed Inner Samples")
+                plt.ylabel(f"Best Frame Score After Evolving {method_name}")
+                plt.title(f"Adaptive Convergence - {method_name}")
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(
+                    os.path.join(self._log_dir, f"convergence_method_{method_name}.png"),
+                    dpi=150,
+                )
+                plt.close()
         except Exception:
             traceback.print_exc()
 
@@ -311,6 +345,7 @@ class Inner:
         self.stats = {method: MethodStats() for method in self.method_order}
         self.dispatch_order = 0
         self.profiler = InnerProfiler(log_dir=os.path.join(self.eoh_log_root, self.algorithm_frame.frame_id or "inner_only"))
+        self.method_eoh_cache: dict[str, EoH] = {}
     
     def replace(self, method_name, func):
         code = self.algorithm_frame.body
@@ -457,6 +492,7 @@ class Inner:
         stats = self.stats[method]
         stats.call_count += 1
         stats.used_budget += budget
+        stats.total_sample_calls += budget
         stats.last_score = score_after
         if score_after is not None:
             stats.best_score = score_after if stats.best_score is None else max(stats.best_score, score_after)
@@ -497,34 +533,61 @@ class Inner:
         )
 
     def evolve_once(self, cur_method, cur_template_program, method_budget: int):
-        frame_log_dir = os.path.join(
-            self.eoh_log_root,
-            self.algorithm_frame.frame_id or "unknown_frame",
-            cur_method,
-        )
+        cached_eoh = self.method_eoh_cache.get(cur_method)
         neighbor_context = self._neighbor_context(cur_method)
-        evaluation = TSPEvaluation(template_program=cur_template_program,
-                                   task_description=task_description_inner,
-                                   instance=self.train_instance, 
-                                   method_name=cur_method,
-                                   algorithm_str=self.algorithm_frame.body,
-                                   score_mode="absolute_distance")
-        evolve_frame = EoH(llm=self.llm,
-                           profiler=ProfilerBase(log_dir=frame_log_dir, log_style='complex'),
-                           evaluation=evaluation,
-                           max_sample_nums=method_budget,
-                           max_generations=100,
-                           pop_size=self.pop_size,
-                           num_samplers=self.pop_size,
-                           num_evaluators=self.pop_size,
-                           method_usage=self.algorithm_frame.method_usage(cur_method),
-                           method_introduction=self.algorithm_frame.other_method_introductions(cur_method),
-                           main_stream=self.algorithm_frame.main_stream(),
-                           use_adj_prev_operator=self.use_adj_prev_operator and neighbor_context["prev_method_name"] is not None,
-                           use_adj_next_operator=self.use_adj_next_operator and neighbor_context["next_method_name"] is not None,
-                           **neighbor_context,
-                           debug_mode=True)
+        if cached_eoh is None:
+            frame_log_dir = os.path.join(
+                self.eoh_log_root,
+                self.algorithm_frame.frame_id or "unknown_frame",
+                cur_method,
+            )
+            evaluation = TSPEvaluation(template_program=cur_template_program,
+                                       task_description=task_description_inner,
+                                       instance=self.train_instance, 
+                                       method_name=cur_method,
+                                       algorithm_str=self.algorithm_frame.body,
+                                       score_mode="absolute_distance")
+            evolve_frame = EoH(llm=self.llm,
+                               profiler=ProfilerBase(log_dir=frame_log_dir, log_style='complex'),
+                               evaluation=evaluation,
+                               max_sample_nums=method_budget,
+                               max_generations=100,
+                               pop_size=self.pop_size,
+                               num_samplers=self.pop_size,
+                               num_evaluators=self.pop_size,
+                               method_usage=self.algorithm_frame.method_usage(cur_method),
+                               method_introduction=self.algorithm_frame.other_method_introductions(cur_method),
+                               main_stream=self.algorithm_frame.main_stream(),
+                               use_adj_prev_operator=self.use_adj_prev_operator and neighbor_context["prev_method_name"] is not None,
+                               use_adj_next_operator=self.use_adj_next_operator and neighbor_context["next_method_name"] is not None,
+                               **neighbor_context,
+                               debug_mode=True)
+            evolve_frame._max_sample_nums = method_budget
+        else:
+            evolve_frame = cached_eoh
+            evolve_frame.method_usage = self.algorithm_frame.method_usage(cur_method)
+            evolve_frame.method_introduction = self.algorithm_frame.other_method_introductions(cur_method)
+            evolve_frame.main_stream = self.algorithm_frame.main_stream()
+            evolve_frame.prev_method_name = neighbor_context["prev_method_name"]
+            evolve_frame.prev_method_code = neighbor_context["prev_method_code"]
+            evolve_frame.prev_method_thought = neighbor_context["prev_method_thought"]
+            evolve_frame.next_method_name = neighbor_context["next_method_name"]
+            evolve_frame.next_method_code = neighbor_context["next_method_code"]
+            evolve_frame.next_method_thought = neighbor_context["next_method_thought"]
+            evolve_frame._evaluator._evaluation.algorithm_str = self.algorithm_frame.body
+            evolve_frame._evaluator._evaluation.template_program = cur_template_program
+            evolve_frame._template_program_str = cur_template_program
+            evolve_frame._function_to_evolve = TextFunctionProgramConverter.text_to_function(cur_template_program)
+            evolve_frame._template_program = TextFunctionProgramConverter.text_to_program(cur_template_program)
+            evolve_frame._use_adj_prev_operator = self.use_adj_prev_operator and neighbor_context["prev_method_name"] is not None
+            evolve_frame._use_adj_next_operator = self.use_adj_next_operator and neighbor_context["next_method_name"] is not None
+            evolve_frame._sample_score_history = []
+            evolve_frame._sample_order_history = []
+            evolve_frame._used_operator_history = []
+            evolve_frame._resume_mode = True
+            evolve_frame._max_sample_nums = evolve_frame._tot_sample_nums + method_budget
         success = evolve_frame.run()
+        self.method_eoh_cache[cur_method] = evolve_frame
         if not success or len(evolve_frame._population) == 0:
             return None, evolve_frame
         best_population = evolve_frame._population.population or evolve_frame._population._population
@@ -927,8 +990,8 @@ def run_inner_only(
         algorithm_frame=algorithm_frame,
         eoh_log_root="experiment1",
         max_sample_nums=1000,
-        pop_size=10,
-        budget_mode="average",
+        pop_size=5,
+        budget_mode="adaptive",
         benefit_mode="absolute_gain",
         method_selection_mode="greedy",
         per_call_budget_cap=50,
