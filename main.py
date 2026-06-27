@@ -1147,55 +1147,90 @@ def run_inner_only(
     train_seed: int = 0,
     max_train_resample_trials: int = 50,
     eval_num_workers: int | None = None,
-) -> AlgorithmFrame:
-    for benefit_mode in ["relative_gain", "relative_discounted_gain"]:
-        for offset in range(max_train_resample_trials):
-            # If the fixed response cannot get a valid baseline score on the sampled
-            # training set, resample the training instances before starting inner EoH.
-            if offset > 0:
-                train_instance = build_random_train_instances(
-                    train_num_instances,
-                    train_city_num,
-                    seed=train_seed + offset,
+) -> AlgorithmFrame | None:
+    combo_settings = [
+        ("relative_gain", {"prev"}),
+        ("relative_gain", {"next"}),
+        ("relative_gain", {"prev", "next"}),
+        ("relative_discounted_gain", {"prev"}),
+        ("relative_discounted_gain", {"next"}),
+        ("relative_discounted_gain", {"prev", "next"}),
+    ]
+    last_successful_frame = None
+
+    for benefit_mode, operator_mode in combo_settings:
+        operator_tag = "_".join(sorted(operator_mode)) if operator_mode else "none"
+        print(
+            f"Start combination: benefit_mode={benefit_mode}, "
+            f"operator_mode={operator_tag}",
+            flush=True,
+        )
+        try:
+            baseline_ready = False
+            for offset in range(max_train_resample_trials):
+                # Resample the training set until this combination gets a valid baseline.
+                current_train_instance = train_instance
+                if offset > 0:
+                    current_train_instance = build_random_train_instances(
+                        train_num_instances,
+                        train_city_num,
+                        seed=train_seed + offset,
+                    )
+                algorithm_frame = text_to_algorithm(response)
+                algorithm_frame.frame_id = "inner_only_frame"
+                inner = Inner(
+                    llm=llm,
+                    train_instance=current_train_instance,
+                    test_instance=test_instance,
+                    algorithm_frame=algorithm_frame,
+                    eoh_log_root=f"experiment_{benefit_mode}_{operator_tag}",
+                    max_sample_nums=1000,
+                    pop_size=5,
+                    budget_mode="adaptive",
+                    benefit_mode=benefit_mode,
+                    method_selection_mode="softmax",
+                    per_call_budget_cap=50,
+                    discount_factor=0.8,
+                    softmax_temperature=1.0,
+                    use_adj_prev_operator=("prev" in operator_mode),
+                    use_adj_next_operator=("next" in operator_mode),
+                    eval_num_workers=eval_num_workers,
                 )
-            algorithm_frame = text_to_algorithm(response)
-            algorithm_frame.frame_id = "inner_only_frame"
-            inner = Inner(
-                llm=llm,
-                train_instance=train_instance,
-                test_instance=test_instance,
-                algorithm_frame=algorithm_frame,
-                eoh_log_root="experiment_"+str(benefit_mode),
-                max_sample_nums=1000,
-                pop_size=5,
-                budget_mode="adaptive",
-                benefit_mode=benefit_mode,
-                method_selection_mode="softmax",
-                per_call_budget_cap=50,
-                discount_factor=0.8,
-                softmax_temperature=1.0,
-                use_adj_prev_operator=False,
-                use_adj_next_operator=False,
-                eval_num_workers=eval_num_workers,
-            )
-            baseline_score = inner._evaluate_frame()
-            if baseline_score is not None:
+                baseline_score = inner._evaluate_frame()
+                if baseline_score is None:
+                    print(
+                        f"Skip current train seed {train_seed + offset} for "
+                        f"{benefit_mode}/{operator_tag}: baseline score is None.",
+                        flush=True,
+                    )
+                    continue
+
                 inner.algorithm_frame.score = baseline_score
                 print(
                     f"Initial frame baseline score: {baseline_score} "
                     f"(train_seed={train_seed + offset})",
                     flush=True,
                 )
-                return inner.run()
+                last_successful_frame = inner.run()
+                baseline_ready = True
+                break
+
+            if not baseline_ready:
+                print(
+                    f"Skip combination benefit_mode={benefit_mode}, "
+                    f"operator_mode={operator_tag}: failed to obtain a valid "
+                    f"baseline after {max_train_resample_trials} trials.",
+                    flush=True,
+                )
+        except Exception as exc:
             print(
-                f"Initial frame baseline score is None, resample training instances "
-                f"with train_seed={train_seed + offset + 1}.",
+                f"Skip combination benefit_mode={benefit_mode}, "
+                f"operator_mode={operator_tag}: {exc}",
                 flush=True,
             )
-        raise RuntimeError(
-            f"Failed to obtain a valid initial baseline score after "
-            f"{max_train_resample_trials} training-set trials."
-        )
+            traceback.print_exc()
+
+    return last_successful_frame
     
 def main() -> None:
     mode = "inner_only"
