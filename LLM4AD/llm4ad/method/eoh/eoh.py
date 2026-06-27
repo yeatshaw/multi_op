@@ -149,15 +149,19 @@ class EoH:
         self.method_usage = kwargs.get("method_usage", None)
         self.method_introduction = kwargs.get("method_introduction", None)
         self.main_stream = kwargs.get("main_stream", None)
+        self.prev_method_individual = kwargs.get("prev_method_individual", None)
         self.prev_method_name = kwargs.get("prev_method_name", None)
         self.prev_method_code = kwargs.get("prev_method_code", None)
         self.prev_method_thought = kwargs.get("prev_method_thought", None)
+        self.next_method_individual = kwargs.get("next_method_individual", None)
         self.next_method_name = kwargs.get("next_method_name", None)
         self.next_method_code = kwargs.get("next_method_code", None)
         self.next_method_thought = kwargs.get("next_method_thought", None)
         self._sample_score_history = []
         self._sample_order_history = []
         self._plot_sample_order_history = []
+        self._round_start_plot_orders = []
+        self._round_start_plot_scores = []
         self._used_operator_history = []
         self._keep_resources_alive = kwargs.get("keep_resources_alive", False)
         self._plot_global_offset = 0
@@ -171,6 +175,12 @@ class EoH:
         return self._plot_global_offset + (
             local_sample_order - self._plot_round_start_local_count
         )
+
+    def record_round_initial_best(self, score: float | None) -> None:
+        if score is None or math.isinf(score):
+            return
+        self._round_start_plot_orders.append(self._plot_global_offset + 1)
+        self._round_start_plot_scores.append(score)
         
     def _adjust_pop_size(self):
         # adjust population size
@@ -252,14 +262,21 @@ class EoH:
             import matplotlib.pyplot as plt
             from matplotlib.ticker import MaxNLocator
 
+            plot_points = list(zip(self._round_start_plot_orders, self._round_start_plot_scores))
+            plot_points.extend(zip(self._plot_sample_order_history, self._sample_score_history))
+            if not plot_points:
+                return
+            plot_points.sort(key=lambda item: item[0])
+
+            plot_orders = []
             best_so_far = []
             current_best = float('-inf')
-            for score in self._sample_score_history:
+            for order, score in plot_points:
                 current_best = max(current_best, score)
+                plot_orders.append(order)
                 best_so_far.append(current_best)
 
             plt.figure(figsize=(8, 5))
-            plot_orders = self._plot_sample_order_history or self._sample_order_history
             plt.plot(plot_orders, best_so_far, marker='o')
             plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
             plt.xlabel('Sample Order')
@@ -335,19 +352,17 @@ class EoH:
                     if not self._continue_loop():
                         break
 
-                if self._use_adj_prev_operator and self.prev_method_name and self.prev_method_code:
+                if self._use_adj_prev_operator and self.prev_method_individual is not None:
                     indiv = self._population.selection()
                     prompt = EoHPrompt.get_prompt_adj_prev(
                         self._task_description_str,
                         indiv,
+                        self.prev_method_individual,
                         self._function_to_evolve,
                         self.method_name,
                         self.method_usage,
                         self.method_introduction,
                         self.main_stream,
-                        self.prev_method_name,
-                        self.prev_method_code,
-                        self.prev_method_thought,
                     )
                     if self._debug_mode:
                         print(f'AP Prompt: {prompt}')
@@ -355,19 +370,17 @@ class EoH:
                     if not self._continue_loop():
                         break
 
-                if self._use_adj_next_operator and self.next_method_name and self.next_method_code:
+                if self._use_adj_next_operator and self.next_method_individual is not None:
                     indiv = self._population.selection()
                     prompt = EoHPrompt.get_prompt_adj_next(
                         self._task_description_str,
                         indiv,
+                        self.next_method_individual,
                         self._function_to_evolve,
                         self.method_name,
                         self.method_usage,
                         self.method_introduction,
                         self.main_stream,
-                        self.next_method_name,
-                        self.next_method_code,
-                        self.next_method_thought,
                     )
                     if self._debug_mode:
                         print(f'AN Prompt: {prompt}')

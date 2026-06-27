@@ -157,34 +157,31 @@ Do not give additional explanations.'''
         cls,
         task_prompt: str,
         indi: Function,
+        indi_prev: Function,
         template_function: Function,
         method_name: str,
         method_usage: str,
         method_introduction: str,
         main_stream: str | None = None,
-        prev_method_name: str | None = None,
-        prev_method_code: str | None = None,
-        prev_method_thought: str | None = None,
     ):
         assert hasattr(indi, 'algorithm')
+        assert hasattr(indi_prev, 'algorithm')
         temp_func = copy.deepcopy(template_function)
         temp_func.body = ''
         context_block = cls._build_context_block(method_name, method_usage, method_introduction, main_stream)
         prompt_content = f'''{task_prompt}
 {context_block}
 The previous method that feeds the current method is:
-Name: {prev_method_name}
-Thought: {prev_method_thought}
+{indi_prev.algorithm}
 Code:
-{prev_method_code}
+{str(indi_prev)}
 
 The current parent method is:
 Thought: {indi.algorithm}
 Code:
 {str(indi)}
 
-Please create a new implementation for the current method that stays compatible with the previous method while improving the overall algorithm.
-1. First, describe your new algorithm and main steps in one sentence. The description must be inside within boxed {{}}.
+Please create a new implementation for the current method that stays compatible with the previous method while improving the overall algorithm. You should explicitly consider the conceptual continuity between the two methods, so that the role of the current method naturally follows the role of the previous one instead of switching to an incoherent objective.
 2. Next, implement the following Python function:
 {str(temp_func)}
 Do not give additional explanations.'''
@@ -195,16 +192,15 @@ Do not give additional explanations.'''
         cls,
         task_prompt: str,
         indi: Function,
+        indi_next: Function,
         template_function: Function,
         method_name: str,
         method_usage: str,
         method_introduction: str,
         main_stream: str | None = None,
-        next_method_name: str | None = None,
-        next_method_code: str | None = None,
-        next_method_thought: str | None = None,
     ):
         assert hasattr(indi, 'algorithm')
+        assert hasattr(indi_next, 'algorithm')
         temp_func = copy.deepcopy(template_function)
         temp_func.body = ''
         context_block = cls._build_context_block(method_name, method_usage, method_introduction, main_stream)
@@ -216,10 +212,9 @@ Code:
 {str(indi)}
 
 The next method that consumes the output of the current method is:
-Name: {next_method_name}
-Thought: {next_method_thought}
+{indi_next.algorithm}
 Code:
-{next_method_code}
+{str(indi_next)}
 
 Please create a new implementation for the current method that stays compatible with the next method while improving the overall algorithm.
 1. First, describe your new algorithm and main steps in one sentence. The description must be inside within boxed {{}}.

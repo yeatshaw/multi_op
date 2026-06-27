@@ -33,7 +33,7 @@
 
 - 不再用 gap
 - 直接用 tour 的绝对路程
-- 路程越短越好，对应代码里的 score 越大越好（因为返回的是负路程）
+- 路程越短越好，对应代码里的 score 越大越好，因为返回的是负路程
 - 不管当前使用哪种收益模式，算法运行时始终都是根据距离矩阵生成 tour，再由 `evaluate_tour(...)` 计算绝对路程
 
 ### 测试集
@@ -115,22 +115,8 @@
   - `g1 * p^(k-1) + g2 * p^(k-2) + ... + gk * p^0`
   - 其中 `p=discount_factor`，`0 < p < 1`
 
-- `log_last_gain`
-  - 单次收益定义为：
-  - `log10(|new_score - old_score| / |old_score|)`
-  - 如果 `new_score == old_score`，则本次单次收益直接记为 `0`
-  - 如果 `new_score < old_score` 或 `old_score == 0`，则记为 `-inf`
-  - 选择下一次 method 时，直接使用最近一次单次对数收益
-
-- `log_discounted_gain`
-  - 单次收益同样定义为：
-  - `log10(|new_score - old_score| / |old_score|)`
-  - 如果 `new_score == old_score`，则本次单次收益直接记为 `0`
-  - 如果 `new_score < old_score` 或 `old_score == 0`，则记为 `-inf`
-  - method 效益取历史单次对数收益的折扣累计
-
 - `hybrid`
-  - `w1 * absolute_gain + w2 * log_last_gain + w3 * recent_success_rate`
+  - `w1 * absolute_gain + w2 * relative_gain + w3 * recent_success_rate`
   - 权重由 `hybrid_weights` 控制
   - `recent_success_rate` 由最近 `recent_window` 次该 method 调用中正收益比例计算
 
@@ -226,20 +212,7 @@ inner-only 运行结果保存在 `logs_inner_only/...` 下，主要包括：
 - `per_call_budget_cap=50`
 - `discount_factor=0.8`
 
-### 实验 5：固定上限 + log 最近收益
-
-- `budget_mode="adaptive"`
-- `benefit_mode="log_last_gain"`
-- `method_selection_mode="greedy"` 或 `softmax`
-
-### 实验 6：固定上限 + log 折扣累计收益
-
-- `budget_mode="adaptive"`
-- `benefit_mode="log_discounted_gain"`
-- `discount_factor=0.8`
-- `method_selection_mode="greedy"` 或 `softmax`
-
-### 实验 7：固定上限 + 混合效益调度
+### 实验 5：固定上限 + 混合效益调度
 
 - `budget_mode="adaptive"`
 - `benefit_mode="hybrid"`

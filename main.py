@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import ast
+import copy
 import math
 import time
 import json
@@ -86,6 +87,7 @@ class InnerProfiler:
         actual_sample_count: int,
         valid_sample_orders: list[int],
         valid_sample_scores: list[float],
+        round_start_score: float | None = None,
     ) -> None:
         if actual_sample_count <= 0:
             return
@@ -117,6 +119,8 @@ class InnerProfiler:
         self._method_boundaries[method_name].append((start_x, end_x))
 
         current_method_best = method_history["y"][-1] if method_history["y"] else float("-inf")
+        if round_start_score is not None and not math.isinf(round_start_score):
+            current_method_best = max(current_method_best, round_start_score)
         for offset in range(1, actual_sample_count + 1):
             local_order = local_start_order + offset
             if local_order in valid_map:
@@ -383,6 +387,7 @@ class Inner:
         self.dispatch_order = 0
         self.profiler = InnerProfiler(log_dir=os.path.join(self.eoh_log_root, self.algorithm_frame.frame_id or "inner_only"))
         self.method_eoh_cache: dict[str, EoH] = {}
+        self.method_best_individuals: dict[str, object] = {}
     
     def replace(self, method_name, func):
         code = self.algorithm_frame.body
@@ -399,6 +404,7 @@ class Inner:
                         break
 
         self.algorithm_frame.method_introduction[method_name] = func.algorithm
+        self.method_best_individuals[method_name] = copy.deepcopy(func)
 
     def _refresh_population_head_score(
         self,
@@ -451,9 +457,11 @@ class Inner:
         prev_name = self.method_order[idx - 1] if idx > 0 else None
         next_name = self.method_order[idx + 1] if idx < len(self.method_order) - 1 else None
         return {
+            "prev_method_individual": self.method_best_individuals.get(prev_name) if prev_name else None,
             "prev_method_name": prev_name,
             "prev_method_code": self.algorithm_frame.method_code(prev_name) if prev_name else None,
             "prev_method_thought": self.algorithm_frame.method_usage(prev_name) if prev_name else None,
+            "next_method_individual": self.method_best_individuals.get(next_name) if next_name else None,
             "next_method_name": next_name,
             "next_method_code": self.algorithm_frame.method_code(next_name) if next_name else None,
             "next_method_thought": self.algorithm_frame.method_usage(next_name) if next_name else None,
@@ -475,22 +483,7 @@ class Inner:
             return float("-inf")
         return abs(improvement) / base
 
-    def _calculate_log_ratio_gain(self, old_score: float | None, new_score: float | None) -> float:
-        if old_score is None or new_score is None:
-            return float("-inf")
-        base = abs(old_score)
-        if base == 0:
-            return float("-inf")
-        improvement = new_score - old_score
-        if improvement < 0:
-            return float("-inf")
-        if improvement == 0:
-            return 0.0
-        return math.log10(abs(improvement) / base)
-
     def _calculate_benefit_gain(self, old_score: float | None, new_score: float | None) -> float | None:
-        if self.benefit_mode in {"log_last_gain", "log_discounted_gain", "hybrid"}:
-            return self._calculate_log_ratio_gain(old_score, new_score)
         if self.benefit_mode in {"relative_gain", "relative_discounted_gain"}:
             return self._calculate_relative_gain(old_score, new_score)
         return None
@@ -507,9 +500,9 @@ class Inner:
         last_benefit_gain = stats.benefit_history[-1] if stats.benefit_history else float("-inf")
         if self.benefit_mode == "absolute_gain":
             return absolute_gain
-        if self.benefit_mode in {"log_last_gain", "relative_gain"}:
+        if self.benefit_mode == "relative_gain":
             return last_benefit_gain
-        if self.benefit_mode in {"log_discounted_gain", "relative_discounted_gain"}:
+        if self.benefit_mode == "relative_discounted_gain":
             if not stats.benefit_history:
                 return float("-inf")
             total = 0.0
@@ -607,35 +600,34 @@ class Inner:
 
     def _seed_method_population(self, evolve_frame: EoH, method_name: str) -> None:
         # Seed the current framework method into the initial population so the
-        # first evolution round starts from the incumbent implementation.
+        # first evolution round starts from the incumbent implementation. The
+        # seed uses the current frame score directly and counts as one sample.
         method_code = self.algorithm_frame.method_code(method_name)
         if not method_code:
             return
         func = TextFunctionProgramConverter.text_to_function(method_code)
         if func is None:
             return
-        program = TextFunctionProgramConverter.function_to_program(
-            func,
-            evolve_frame._template_program,
-        )
-        if program is None:
-            return
-        score, eval_time = evolve_frame._evaluator.evaluate_program_record_time(program)
+        score = self.algorithm_frame.score
         if score is None or math.isinf(score):
             return
         sample_order = evolve_frame._tot_sample_nums + 1
         func.score = score
-        func.evaluate_time = eval_time
+        func.evaluate_time = 0.0
         func.sample_time = 0.0
         func.algorithm = self.algorithm_frame.method_usage(method_name) or ""
         func.operator = "i1"
+        self.method_best_individuals[method_name] = copy.deepcopy(func)
         evolve_frame._used_operator_history.append("i1")
         if score <= 0:
             evolve_frame._sample_order_history.append(sample_order)
             evolve_frame._sample_score_history.append(score)
+            evolve_frame._plot_sample_order_history.append(
+                evolve_frame.get_plot_sample_order(sample_order)
+            )
         evolve_frame._population.register_function(func)
         if evolve_frame._profiler is not None:
-            evolve_frame._profiler.register_function(func, program=str(program))
+            evolve_frame._profiler.register_function(func, program=self.algorithm_frame.body)
             if hasattr(evolve_frame._profiler, "register_population"):
                 evolve_frame._profiler.register_population(evolve_frame._population)
         evolve_frame._tot_sample_nums += 1
@@ -646,6 +638,7 @@ class Inner:
         population_snapshot = None
         history_start = None
         start_sample_count = None
+        round_start_score = None
         if cached_eoh is None:
             frame_log_dir = os.path.join(
                 self.eoh_log_root,
@@ -675,16 +668,17 @@ class Inner:
                                  **neighbor_context,
                                  keep_resources_alive=True,
                                  debug_mode=False)
+            evolve_frame.set_plot_window(
+                self.total_consumed_samples,
+                0,
+            )
             self._seed_method_population(evolve_frame, cur_method)
             # The seeded incumbent consumes one sample already, so keep the
             # original sample cap instead of granting an extra budget slot.
             evolve_frame._max_sample_nums = method_budget
             history_start = 0
             start_sample_count = 0
-            evolve_frame.set_plot_window(
-                self.total_consumed_samples,
-                start_sample_count,
-            )
+            round_start_score = self.algorithm_frame.score
         else:
             evolve_frame = cached_eoh
             population_snapshot = evolve_frame._population.snapshot()
@@ -693,9 +687,11 @@ class Inner:
             evolve_frame.method_usage = self.algorithm_frame.method_usage(cur_method)
             evolve_frame.method_introduction = self.algorithm_frame.other_method_introductions(cur_method)
             evolve_frame.main_stream = self.algorithm_frame.main_stream()
+            evolve_frame.prev_method_individual = neighbor_context["prev_method_individual"]
             evolve_frame.prev_method_name = neighbor_context["prev_method_name"]
             evolve_frame.prev_method_code = neighbor_context["prev_method_code"]
             evolve_frame.prev_method_thought = neighbor_context["prev_method_thought"]
+            evolve_frame.next_method_individual = neighbor_context["next_method_individual"]
             evolve_frame.next_method_name = neighbor_context["next_method_name"]
             evolve_frame.next_method_code = neighbor_context["next_method_code"]
             evolve_frame.next_method_thought = neighbor_context["next_method_thought"]
@@ -714,6 +710,8 @@ class Inner:
                 self.total_consumed_samples,
                 start_sample_count,
             )
+            evolve_frame.record_round_initial_best(self.algorithm_frame.score)
+            round_start_score = self.algorithm_frame.score
         success = evolve_frame.run()
         self.method_eoh_cache[cur_method] = evolve_frame
         actual_sample_count = evolve_frame._tot_sample_nums - (start_sample_count or 0)
@@ -724,6 +722,7 @@ class Inner:
                 actual_sample_count=actual_sample_count,
                 valid_sample_orders=evolve_frame._sample_order_history[history_start:],
                 valid_sample_scores=evolve_frame._sample_score_history[history_start:],
+                round_start_score=round_start_score,
             )
         if not success or len(evolve_frame._population) == 0:
             if population_snapshot is not None:
@@ -765,7 +764,7 @@ class Inner:
                 )
                 self._record_method_step(method, budget, actual_sample_count, score_before, self.algorithm_frame.score, float("-inf"), getattr(evolve_frame, "_used_operator_history", []), {})
                 continue
-            score_after = self._evaluate_frame()
+            score_after = best_func.score
             self.algorithm_frame.score = score_after
             gain = self._calculate_gain(score_before, score_after)
             benefit_gain = self._calculate_benefit_gain(score_before, score_after)
@@ -803,7 +802,7 @@ class Inner:
             self.total_consumed_budget += budget
             self.total_consumed_samples += actual_sample_count
             if best_func is not None:
-                score_after = self._evaluate_frame()
+                score_after = best_func.score
                 self.algorithm_frame.score = score_after
                 gain = self._calculate_gain(score_before, score_after)
                 benefit_gain = self._calculate_benefit_gain(score_before, score_after)
@@ -842,7 +841,7 @@ class Inner:
             self.total_consumed_budget += budget
             self.total_consumed_samples += actual_sample_count
             if best_func is not None:
-                score_after = self._evaluate_frame()
+                score_after = best_func.score
                 self.algorithm_frame.score = score_after
                 gain = self._calculate_gain(score_before, score_after)
                 benefit_gain = self._calculate_benefit_gain(score_before, score_after)
@@ -1149,53 +1148,54 @@ def run_inner_only(
     max_train_resample_trials: int = 50,
     eval_num_workers: int | None = None,
 ) -> AlgorithmFrame:
-    for offset in range(max_train_resample_trials):
-        # If the fixed response cannot get a valid baseline score on the sampled
-        # training set, resample the training instances before starting inner EoH.
-        if offset > 0:
-            train_instance = build_random_train_instances(
-                train_num_instances,
-                train_city_num,
-                seed=train_seed + offset,
+    for benefit_mode in ["relative_gain", "relative_discounted_gain"]:
+        for offset in range(max_train_resample_trials):
+            # If the fixed response cannot get a valid baseline score on the sampled
+            # training set, resample the training instances before starting inner EoH.
+            if offset > 0:
+                train_instance = build_random_train_instances(
+                    train_num_instances,
+                    train_city_num,
+                    seed=train_seed + offset,
+                )
+            algorithm_frame = text_to_algorithm(response)
+            algorithm_frame.frame_id = "inner_only_frame"
+            inner = Inner(
+                llm=llm,
+                train_instance=train_instance,
+                test_instance=test_instance,
+                algorithm_frame=algorithm_frame,
+                eoh_log_root="experiment_"+str(benefit_mode),
+                max_sample_nums=1000,
+                pop_size=5,
+                budget_mode="adaptive",
+                benefit_mode=benefit_mode,
+                method_selection_mode="softmax",
+                per_call_budget_cap=50,
+                discount_factor=0.8,
+                softmax_temperature=1.0,
+                use_adj_prev_operator=False,
+                use_adj_next_operator=False,
+                eval_num_workers=eval_num_workers,
             )
-        algorithm_frame = text_to_algorithm(response)
-        algorithm_frame.frame_id = "inner_only_frame"
-        inner = Inner(
-            llm=llm,
-            train_instance=train_instance,
-            test_instance=test_instance,
-            algorithm_frame=algorithm_frame,
-            eoh_log_root="experiment2",
-            max_sample_nums=1000,
-            pop_size=5,
-            budget_mode="adaptive",
-            benefit_mode="absolute_gain",
-            method_selection_mode="greedy",
-            per_call_budget_cap=50,
-            discount_factor=0.8,
-            softmax_temperature=1.0,
-            use_adj_prev_operator=False,
-            use_adj_next_operator=False,
-            eval_num_workers=eval_num_workers,
-        )
-        baseline_score = inner._evaluate_frame()
-        if baseline_score is not None:
-            inner.algorithm_frame.score = baseline_score
+            baseline_score = inner._evaluate_frame()
+            if baseline_score is not None:
+                inner.algorithm_frame.score = baseline_score
+                print(
+                    f"Initial frame baseline score: {baseline_score} "
+                    f"(train_seed={train_seed + offset})",
+                    flush=True,
+                )
+                return inner.run()
             print(
-                f"Initial frame baseline score: {baseline_score} "
-                f"(train_seed={train_seed + offset})",
+                f"Initial frame baseline score is None, resample training instances "
+                f"with train_seed={train_seed + offset + 1}.",
                 flush=True,
             )
-            return inner.run()
-        print(
-            f"Initial frame baseline score is None, resample training instances "
-            f"with train_seed={train_seed + offset + 1}.",
-            flush=True,
+        raise RuntimeError(
+            f"Failed to obtain a valid initial baseline score after "
+            f"{max_train_resample_trials} training-set trials."
         )
-    raise RuntimeError(
-        f"Failed to obtain a valid initial baseline score after "
-        f"{max_train_resample_trials} training-set trials."
-    )
     
 def main() -> None:
     mode = "inner_only"
