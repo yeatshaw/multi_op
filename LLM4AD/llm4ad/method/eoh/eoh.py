@@ -157,7 +157,20 @@ class EoH:
         self.next_method_thought = kwargs.get("next_method_thought", None)
         self._sample_score_history = []
         self._sample_order_history = []
+        self._plot_sample_order_history = []
         self._used_operator_history = []
+        self._keep_resources_alive = kwargs.get("keep_resources_alive", False)
+        self._plot_global_offset = 0
+        self._plot_round_start_local_count = 0
+
+    def set_plot_window(self, global_offset: int, round_start_local_count: int) -> None:
+        self._plot_global_offset = global_offset
+        self._plot_round_start_local_count = round_start_local_count
+
+    def get_plot_sample_order(self, local_sample_order: int) -> int:
+        return self._plot_global_offset + (
+            local_sample_order - self._plot_round_start_local_count
+        )
         
     def _adjust_pop_size(self):
         # adjust population size
@@ -214,13 +227,17 @@ class EoH:
         func.operator = operator
         self._used_operator_history.append(operator)
         if score is not None and not math.isinf(score) and score <= 0:
-            self._sample_order_history.append(self._tot_sample_nums + 1)
+            local_order = self._tot_sample_nums + 1
+            self._sample_order_history.append(local_order)
+            self._plot_sample_order_history.append(
+                self.get_plot_sample_order(local_order)
+            )
             self._sample_score_history.append(score)
         if self._profiler is not None:
             self._profiler.register_function(func, program=str(program))
             if isinstance(self._profiler, EoHProfiler):
                 self._profiler.register_population(self._population)
-            self._tot_sample_nums += 1
+        self._tot_sample_nums += 1
 
         # register to the population
         self._population.register_function(func)
@@ -233,6 +250,7 @@ class EoH:
             return
         try:
             import matplotlib.pyplot as plt
+            from matplotlib.ticker import MaxNLocator
 
             best_so_far = []
             current_best = float('-inf')
@@ -241,7 +259,9 @@ class EoH:
                 best_so_far.append(current_best)
 
             plt.figure(figsize=(8, 5))
-            plt.plot(self._sample_order_history, best_so_far, marker='o')
+            plot_orders = self._plot_sample_order_history or self._sample_order_history
+            plt.plot(plot_orders, best_so_far, marker='o')
+            plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
             plt.xlabel('Sample Order')
             plt.ylabel('Best Score So Far')
             plt.title(f'EoH Best Score Curve - {self.method_name}')
@@ -405,10 +425,18 @@ class EoH:
         except Exception:
             pass
 
+    def close(self):
+        self._shutdown_evaluation_executor()
+        try:
+            self._sampler.llm.close()
+        except Exception:
+            pass
+
     def run(self) -> bool:
         try:
             if not self._resume_mode:
                 # do initialization
+                self._population.set_required_feasible_offspring(self._pop_size)
                 self._multi_threaded_sampling(self._iteratively_init_population)
                 self._population.survival()
                 # terminate searching if
@@ -418,6 +446,9 @@ class EoH:
                         f'Please increase the `initial_sample_nums_max` argument (currently {self._initial_sample_nums_max}). '
                         f'Please also check your evaluation implementation and LLM implementation.')
                     return False
+            else:
+                self._population.clear_pending_offspring()
+                self._population.set_required_feasible_offspring(max(1, self._pop_size - 1))
 
             # evolutionary search
             self._multi_threaded_sampling(self._iteratively_use_eoh_operator)
@@ -428,5 +459,5 @@ class EoH:
                 self._profiler.finish()
             return len(self._population) > 0
         finally:
-            self._shutdown_evaluation_executor()
-            self._sampler.llm.close()
+            if not self._keep_resources_alive:
+                self.close()

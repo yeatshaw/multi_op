@@ -23,17 +23,17 @@
 - 每个实例先生成 `city_num x 2` 的坐标
 - 再转成欧氏距离矩阵输入算法
 
-当前由 [main.py](D:\A_Shaw\Academic\Files\program\multi_op\main.py) 中这几个参数控制：
+当前由 [main.py](D:\A_Shaw\Academic\Files\program\multi_op\main.py) 中这些参数控制：
 
 - `train_city_num`
 - `train_num_instances`
-- `seed`
+- `train_seed`
 
 训练阶段的 score：
 
 - 不再用 gap
 - 直接用 tour 的绝对路程
-- 路程越短越好
+- 路程越短越好，对应代码里的 score 越大越好（因为返回的是负路程）
 - 不管当前使用哪种收益模式，算法运行时始终都是根据距离矩阵生成 tour，再由 `evaluate_tour(...)` 计算绝对路程
 
 ### 测试集
@@ -42,12 +42,12 @@
 
 - 数据来源：`multi_op/tsp_instances.npz`
 - 读取方式：`load_tsp_dictionaries()`
-- 只使用其中的距离矩阵实例及对应最优值
+- 使用其中的距离矩阵实例及对应最优值
 - 当前按 `test_max_city_num` 过滤实例规模
 
 测试阶段的 score：
 
-- 仍然用 gap
+- 使用 gap
 - 只在每次 inner-only 实验全部结束后测试一次
 
 ## 3. 入口与运行
@@ -93,7 +93,7 @@
 - `budget_mode="adaptive"`
 - 每次 method 进化最多用 `per_call_budget_cap` 个 sample
 - 每轮结束后根据 method 的效益值选择下一次进化哪个 method
-- 预算耗尽或所有 method 都没有正收益时停止
+- 当前逻辑是只要还有预算就继续跑，直到预算耗尽
 
 ## 5. 效益值策略
 
@@ -101,28 +101,41 @@
 
 - `absolute_gain`
   - 本轮 method 进化后，整框架训练分数的绝对提升量
+  - 公式：`new_score - old_score`
 
-- `gain_per_sample`
-  - 本轮训练分数提升量 / 该 method 已消耗预算
+- `relative_gain`
+  - 单次收益定义为相对提升量
+  - 公式：`|new_score - old_score| / |old_score|`
+  - 仅当 `new_score >= old_score` 时有效，否则记为 `-inf`
 
-- `log_last_gain`
-  - 单次收益定义为 `log10(|old_score| / |new_score|)`
-  - 选择下一个 method 时，直接用最近一次进化的该收益
-
-- `log_discounted_gain`
-  - 单次收益同样定义为 `log10(|old_score| / |new_score|)`
-  - 选择下一个 method 时，使用折扣累计收益：
+- `relative_discounted_gain`
+  - 单次收益同样定义为相对提升量
+  - 公式：`|new_score - old_score| / |old_score|`
+  - method 效益取历史单次相对收益的折扣累计：
   - `g1 * p^(k-1) + g2 * p^(k-2) + ... + gk * p^0`
   - 其中 `p=discount_factor`，`0 < p < 1`
 
+- `log_last_gain`
+  - 单次收益定义为：
+  - `log10(|new_score - old_score| / |old_score|)`
+  - 如果 `new_score == old_score`，则本次单次收益直接记为 `0`
+  - 如果 `new_score < old_score` 或 `old_score == 0`，则记为 `-inf`
+  - 选择下一次 method 时，直接使用最近一次单次对数收益
+
+- `log_discounted_gain`
+  - 单次收益同样定义为：
+  - `log10(|new_score - old_score| / |old_score|)`
+  - 如果 `new_score == old_score`，则本次单次收益直接记为 `0`
+  - 如果 `new_score < old_score` 或 `old_score == 0`，则记为 `-inf`
+  - method 效益取历史单次对数收益的折扣累计
+
 - `hybrid`
-  - `w1 * absolute_gain + w2 * gain_per_sample + w3 * recent_success_rate`
+  - `w1 * absolute_gain + w2 * log_last_gain + w3 * recent_success_rate`
   - 权重由 `hybrid_weights` 控制
   - `recent_success_rate` 由最近 `recent_window` 次该 method 调用中正收益比例计算
 
 统一口径：
 
-- `gain = new_score - old_score`
 - 训练 score 越大越好
 - `None / inf / -inf` 都视为无效分数，不参与正收益计算
 
@@ -184,7 +197,7 @@ inner-only 运行结果保存在 `logs_inner_only/...` 下，主要包括：
 - `convergence_inner.png`
   - 以总消耗 sample 为横轴、整框架训练历史最优 score 为纵轴的收敛图
 
-- `experiment1/.../<frame_id>/<method>/...`
+- `.../<frame_id>/<method>/...`
   - 每个 method 自己的一套 EoH 日志与 method 内部收敛图
 
 ## 9. 推荐实验组合
@@ -194,24 +207,24 @@ inner-only 运行结果保存在 `logs_inner_only/...` 下，主要包括：
 - `budget_mode="average"`
 - `benefit_mode="absolute_gain"`
 
-### 实验 2：固定上限 + 绝对提分调度
+### 实验 2：固定上限 + 绝对提升调度
 
 - `budget_mode="adaptive"`
 - `benefit_mode="absolute_gain"`
 - `per_call_budget_cap=50`
 
-### 实验 3：固定上限 + 单位预算提分调度
+### 实验 3：固定上限 + 相对提升调度
 
 - `budget_mode="adaptive"`
-- `benefit_mode="gain_per_sample"`
+- `benefit_mode="relative_gain"`
 - `per_call_budget_cap=50`
 
-### 实验 4：固定上限 + 混合效益调度
+### 实验 4：固定上限 + 相对折扣累计收益
 
 - `budget_mode="adaptive"`
-- `benefit_mode="hybrid"`
+- `benefit_mode="relative_discounted_gain"`
 - `per_call_budget_cap=50`
-- 视情况修改 `hybrid_weights`
+- `discount_factor=0.8`
 
 ### 实验 5：固定上限 + log 最近收益
 
@@ -226,6 +239,13 @@ inner-only 运行结果保存在 `logs_inner_only/...` 下，主要包括：
 - `discount_factor=0.8`
 - `method_selection_mode="greedy"` 或 `softmax`
 
+### 实验 7：固定上限 + 混合效益调度
+
+- `budget_mode="adaptive"`
+- `benefit_mode="hybrid"`
+- `per_call_budget_cap=50`
+- 视情况修改 `hybrid_weights`
+
 ## 10. 实现说明
 
 当前实现中的关键点：
@@ -237,3 +257,4 @@ inner-only 运行结果保存在 `logs_inner_only/...` 下，主要包括：
 - 训练阶段评估用绝对路程
 - 测试阶段评估用 TSPLIB gap
 - 邻接算子中的 thought 当前默认使用 `method_introduction`
+- 再次进化某个 method 时，会复用该 method 的缓存种群，并把 `population[0]` 的分数刷新为当前整框架分数

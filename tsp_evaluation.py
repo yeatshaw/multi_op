@@ -22,7 +22,7 @@ class TSPEvaluation(Evaluation):
     """Evaluator for traveling salesman problem."""
 
     def __init__(self,
-                 timeout_seconds=600,
+                 timeout_seconds=120,
                  **kwargs):
         """
             Args:
