@@ -75,23 +75,17 @@ class Population:
         self._generation += 1
 
     def register_function(self, func: Function):
-        # in population initialization, we only accept valid functions
-        if self._generation == 0 and func.score is None:
+        # Only feasible individuals are allowed to enter the pending offspring pool.
+        if not self._is_feasible(func):
             return
-        # if the score is None, we still put it into the population,
-        # we set the score to '-inf'
-        if func.score is None:
-            func.score = float('-inf')
         try:
             self._lock.acquire()
             if self.has_duplicate_function(func):
-                func.score = float('-inf')
-            # register to next_gen
+                return
             self._next_gen_pop.append(func)
-            # Only update the population after accumulating enough feasible offspring.
-            if self.feasible_next_gen_size() >= self._required_feasible_offspring:
+            if len(self._next_gen_pop) >= self._required_feasible_offspring:
                 self.survival()
-        except Exception as e:
+        except Exception:
             return
         finally:
             self._lock.release()

@@ -67,3 +67,15 @@ method_args:
             - arg1: str, ...
 }
 """
+
+func_template = '''
+thought: {...}
+
+```python
+code:
+{
+def cur_method_name(self, cur_method_arg1, cur_method_arg2, ...):
+    ...
+}
+```
+'''

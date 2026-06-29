@@ -108,6 +108,25 @@ class ProfilerBase:
             finally:
                 self._register_function_lock.release()
 
+    def register_function_with_order(
+        self,
+        function: Function,
+        sample_order: int,
+        program: str = '',
+        *,
+        resume_mode: bool = False,
+    ):
+        try:
+            self._register_function_lock.acquire()
+            old_num_samples = self._num_samples
+            self._num_samples = sample_order
+            self._record_and_print_verbose(function, program=program, resume_mode=resume_mode)
+            if not resume_mode:
+                self._write_json(function, program)
+            self._num_samples = max(old_num_samples, sample_order)
+        finally:
+            self._register_function_lock.release()
+
     def finish(self):
         pass
 
@@ -135,13 +154,17 @@ class ProfilerBase:
             'function': str(function),
             'score': function.score,
             'operator': function.operator,
+            'trace_status': getattr(function, 'trace_status', None),
             'program': program,
         }
 
         if record_type == 'history':
-            lower_bound = ((sample_order - 1) // record_sep) * record_sep
-            upper_bound = lower_bound + record_sep
-            filename = f'samples_{lower_bound + 1}~{upper_bound}.json'
+            if sample_order <= record_sep:
+                filename = f'samples_0~{record_sep}.json'
+            else:
+                lower_bound = ((sample_order - 1) // record_sep) * record_sep
+                upper_bound = lower_bound + record_sep
+                filename = f'samples_{lower_bound + 1}~{upper_bound}.json'
         else:
             filename = 'samples_best.json'
 
@@ -164,6 +187,7 @@ class ProfilerBase:
         evaluate_time = function.evaluate_time
         score = function.score
         operator = function.operator
+        trace_status = getattr(function, 'trace_status', None)
 
         # update best function
         if self._num_objs < 2:
@@ -190,6 +214,7 @@ class ProfilerBase:
                 print(f'{function_str}')
                 print(f'------------------------------------------------------')
                 print(f'Operator     : {operator}')
+                print(f'Trace status : {trace_status}')
                 print(f'Score        : {str(score)}')
                 print(f'Sample time  : {str(sample_time)}')
                 print(f'Evaluate time: {str(evaluate_time)}')

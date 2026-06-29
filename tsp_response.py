@@ -156,75 +156,33 @@ Class_args:
 - max_2opt_passes: int, Maximum number of full 2-opt improvement passes per tour.
 '''
 
-response1='''
+func_response = '''
+thought: The method selects diverse starting cities by strategically choosing them based on their distances to each other, ensuring a well-spread and representative set for multi-start TSP construction.
+
 ```python
-Code:
-{
-import numpy as np
-import random
-
-class Algorithm:
-    def __init__(self, **kwargs):
-        self.city_num = kwargs['city_num']
-        self.tour_evaluation_function = kwargs['tour_evaluation_function']
-        
-    def run(self, **kwargs):
-        distance_matrix = kwargs['distance_matrix']
-        initial_tour = self.generate_initial_tour()
-        best_tour = initial_tour
-        best_distance = self.tour_evaluation_function(best_tour, distance_matrix)
-
-        for _ in range(1000):  # Example iteration limit
-            new_tour = self.local_search(best_tour)
-            new_distance = self.tour_evaluation_function(new_tour, distance_matrix)
-            if new_distance < best_distance:
-                best_tour = new_tour
-                best_distance = new_distance
-        
-        return best_tour
+code:
+def select_starts(self, distance_matrix):
+    import numpy as np
     
-    def generate_initial_tour(self):
-        tour = list(range(self.city_num))
-        random.shuffle(tour)
-        return tour
+    city_num = distance_matrix.shape[0]
+    max_starts = min(self.max_starts, city_num)
     
-    def local_search(self, current_tour):
-        best_tour = current_tour[:]
-        for i in range(len(current_tour) - 1):
-            for j in range(i + 1, len(current_tour)):
-                new_tour = best_tour[:]
-                new_tour[i:j+1] = reversed(best_tour[i:j+1])
-                if self.tour_evaluation_function(new_tour, np.zeros((self.city_num, self.city_num))) < self.tour_evaluation_function(best_tour, np.zeros((self.city_num, self.city_num))):
-                    best_tour = new_tour
-        return best_tour
-}
+    # Create a list to store selected starting cities
+    starts = []
+    remaining_cities = list(range(city_num))
+    
+    # Randomly choose the first start city
+    first_city = np.random.choice(remaining_cities)
+    starts.append(first_city)
+    remaining_cities.remove(first_city)
+    
+    while len(starts) < max_starts:
+        distances = np.array([min(distance_matrix[city, start] for start in starts) for city in remaining_cities])
+        next_city_index = np.argmax(distances)
+        next_city = remaining_cities[next_city_index]
+        starts.append(next_city)
+        remaining_cities.remove(next_city)
+    
+    return starts
 ```
-
-method:
-{
-- run: this method is used to execute the main algorithm, generating an initial tour and applying a local search to find the best tour.
-- generate_initial_tour: this method is used to create a random initial visiting order of the cities.
-- local_search: this method is used to improve the current tour by checking for better arrangements through pairwise swaps.
-}
-
-Class_args:
-{
-- city_num: int, the number of cities in the TSP instance.
-- tour_evaluation_function: callable, a function that evaluates the total length of a given tour based on the distance matrix.
-}
-
-method_args:
-{    
-    generate_initial_tour:
-        Arg:
-            - None: Generates a random initial tour.
-        Return:
-            - tour: list[int], a randomly shuffled list representing the order of cities.
-
-    local_search:
-        Arg:
-            - current_tour: list[int], the currently known best visiting order of cities.
-        Return:
-            - best_tour: list[int], a potentially improved visiting order of cities after local search.
-}
 '''

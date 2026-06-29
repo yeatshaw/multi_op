@@ -360,6 +360,7 @@ class Inner:
                  recent_window: int = 3,
                  use_adj_prev_operator: bool = True,
                  use_adj_next_operator: bool = True,
+                 use_context_prompt: bool = True,
                  eval_num_workers: int | None = None):
         self.llm = llm
         self.train_instance = train_instance
@@ -378,6 +379,7 @@ class Inner:
         self.recent_window = recent_window
         self.use_adj_prev_operator = use_adj_prev_operator
         self.use_adj_next_operator = use_adj_next_operator
+        self.use_context_prompt = use_context_prompt
         self.eval_num_workers = eval_num_workers
         self.method_order = self.algorithm_frame.method_order()
         self.remaining_budget = max_sample_nums
@@ -388,6 +390,7 @@ class Inner:
         self.profiler = InnerProfiler(log_dir=os.path.join(self.eoh_log_root, self.algorithm_frame.frame_id or "inner_only"))
         self.method_eoh_cache: dict[str, EoH] = {}
         self.method_best_individuals: dict[str, object] = {}
+        self._initialize_method_best_individuals()
     
     def replace(self, method_name, func):
         code = self.algorithm_frame.body
@@ -405,6 +408,23 @@ class Inner:
 
         self.algorithm_frame.method_introduction[method_name] = func.algorithm
         self.method_best_individuals[method_name] = copy.deepcopy(func)
+
+    def _initialize_method_best_individuals(self) -> None:
+        # Initialize every method's incumbent from the original response so
+        # adj_prev/adj_next can use neighboring methods from the first round.
+        for method_name in self.method_order:
+            method_code = self.algorithm_frame.method_code(method_name)
+            if not method_code:
+                continue
+            func = TextFunctionProgramConverter.text_to_function(method_code)
+            if func is None:
+                continue
+            func.algorithm = self.algorithm_frame.method_usage(method_name) or ""
+            func.score = None
+            func.evaluate_time = 0.0
+            func.sample_time = 0.0
+            func.operator = "response"
+            self.method_best_individuals[method_name] = copy.deepcopy(func)
 
     def _refresh_population_head_score(
         self,
@@ -457,14 +477,10 @@ class Inner:
         prev_name = self.method_order[idx - 1] if idx > 0 else None
         next_name = self.method_order[idx + 1] if idx < len(self.method_order) - 1 else None
         return {
+            "prev_name": prev_name,
+            "next_name": next_name,
             "prev_method_individual": self.method_best_individuals.get(prev_name) if prev_name else None,
-            "prev_method_name": prev_name,
-            "prev_method_code": self.algorithm_frame.method_code(prev_name) if prev_name else None,
-            "prev_method_thought": self.algorithm_frame.method_usage(prev_name) if prev_name else None,
             "next_method_individual": self.method_best_individuals.get(next_name) if next_name else None,
-            "next_method_name": next_name,
-            "next_method_code": self.algorithm_frame.method_code(next_name) if next_name else None,
-            "next_method_thought": self.algorithm_frame.method_usage(next_name) if next_name else None,
         }
 
     def _calculate_gain(self, old_score: float | None, new_score: float | None) -> float:
@@ -591,6 +607,46 @@ class Inner:
             }
         )
 
+    def _finalize_method_round(
+        self,
+        method: str,
+        budget: int,
+        actual_sample_count: int,
+        score_before: float | None,
+        evolve_frame: EoH,
+        benefit_map: dict[str, float],
+        best_func=None,
+    ) -> None:
+        self.remaining_budget -= budget
+        self.total_consumed_budget += budget
+        self.total_consumed_samples += actual_sample_count
+
+        used_operators = getattr(evolve_frame, "_used_operator_history", [])
+        score_after = self.algorithm_frame.score if best_func is None else best_func.score
+        if best_func is not None:
+            self.algorithm_frame.score = score_after
+        gain = self._calculate_gain(score_before, score_after)
+        benefit_gain = self._calculate_benefit_gain(score_before, score_after)
+
+        self._update_method_stats(
+            method,
+            actual_sample_count,
+            score_after,
+            gain,
+            used_operators,
+            benefit_gain,
+        )
+        self._record_method_step(
+            method,
+            budget,
+            actual_sample_count,
+            score_before,
+            score_after,
+            gain,
+            used_operators,
+            benefit_map,
+        )
+
     def _close_cached_eoh(self) -> None:
         for evolve_frame in self.method_eoh_cache.values():
             try:
@@ -600,8 +656,8 @@ class Inner:
 
     def _seed_method_population(self, evolve_frame: EoH, method_name: str) -> None:
         # Seed the current framework method into the initial population so the
-        # first evolution round starts from the incumbent implementation. The
-        # seed uses the current frame score directly and counts as one sample.
+        # first evolution round starts from the incumbent implementation.
+        # The seed is treated as sample index 0 and does not consume budget.
         method_code = self.algorithm_frame.method_code(method_name)
         if not method_code:
             return
@@ -611,7 +667,6 @@ class Inner:
         score = self.algorithm_frame.score
         if score is None or math.isinf(score):
             return
-        sample_order = evolve_frame._tot_sample_nums + 1
         func.score = score
         func.evaluate_time = 0.0
         func.sample_time = 0.0
@@ -619,23 +674,27 @@ class Inner:
         func.operator = "i1"
         self.method_best_individuals[method_name] = copy.deepcopy(func)
         evolve_frame._used_operator_history.append("i1")
-        if score <= 0:
-            evolve_frame._sample_order_history.append(sample_order)
-            evolve_frame._sample_score_history.append(score)
-            evolve_frame._plot_sample_order_history.append(
-                evolve_frame.get_plot_sample_order(sample_order)
-            )
-        evolve_frame._population.register_function(func)
+        evolve_frame._current_best_score = score
+        evolve_frame._sample_order_history.append(0)
+        evolve_frame._sample_score_history.append(score)
+        evolve_frame._plot_sample_order_history.append(
+            evolve_frame.get_plot_sample_order(0)
+        )
+        if not evolve_frame._population.has_duplicate_function(func):
+            evolve_frame._population.population.append(func)
+            evolve_frame._population.population.sort(key=lambda f: f.score, reverse=True)
         if evolve_frame._profiler is not None:
-            evolve_frame._profiler.register_function(func, program=self.algorithm_frame.body)
+            evolve_frame._profiler.register_function_with_order(
+                func,
+                sample_order=0,
+                program=self.algorithm_frame.body,
+            )
             if hasattr(evolve_frame._profiler, "register_population"):
                 evolve_frame._profiler.register_population(evolve_frame._population)
-        evolve_frame._tot_sample_nums += 1
 
     def evolve_once(self, cur_method, cur_template_program, method_budget: int):
         cached_eoh = self.method_eoh_cache.get(cur_method)
         neighbor_context = self._neighbor_context(cur_method)
-        population_snapshot = None
         history_start = None
         start_sample_count = None
         round_start_score = None
@@ -660,11 +719,15 @@ class Inner:
                                pop_size=self.pop_size,
                                num_samplers=self.pop_size,
                                num_evaluators=self.pop_size,
+                               use_e2_operator=True,
+                               use_m1_operator=True,
+                               use_m2_operator=True,
                                method_usage=self.algorithm_frame.method_usage(cur_method),
                                method_introduction=self.algorithm_frame.other_method_introductions(cur_method),
                                main_stream=self.algorithm_frame.main_stream(),
-                                 use_adj_prev_operator=self.use_adj_prev_operator and neighbor_context["prev_method_name"] is not None,
-                                 use_adj_next_operator=self.use_adj_next_operator and neighbor_context["next_method_name"] is not None,
+                               use_context_prompt=self.use_context_prompt,
+                               use_adj_prev_operator=self.use_adj_prev_operator and neighbor_context["prev_name"] is not None,
+                               use_adj_next_operator=self.use_adj_next_operator and neighbor_context["next_name"] is not None,
                                  **neighbor_context,
                                  keep_resources_alive=True,
                                  debug_mode=False)
@@ -681,27 +744,20 @@ class Inner:
             round_start_score = self.algorithm_frame.score
         else:
             evolve_frame = cached_eoh
-            population_snapshot = evolve_frame._population.snapshot()
             history_start = len(evolve_frame._sample_order_history)
             start_sample_count = evolve_frame._tot_sample_nums
             evolve_frame.method_usage = self.algorithm_frame.method_usage(cur_method)
             evolve_frame.method_introduction = self.algorithm_frame.other_method_introductions(cur_method)
             evolve_frame.main_stream = self.algorithm_frame.main_stream()
             evolve_frame.prev_method_individual = neighbor_context["prev_method_individual"]
-            evolve_frame.prev_method_name = neighbor_context["prev_method_name"]
-            evolve_frame.prev_method_code = neighbor_context["prev_method_code"]
-            evolve_frame.prev_method_thought = neighbor_context["prev_method_thought"]
             evolve_frame.next_method_individual = neighbor_context["next_method_individual"]
-            evolve_frame.next_method_name = neighbor_context["next_method_name"]
-            evolve_frame.next_method_code = neighbor_context["next_method_code"]
-            evolve_frame.next_method_thought = neighbor_context["next_method_thought"]
             evolve_frame._evaluator._evaluator.algorithm_str = self.algorithm_frame.body
             evolve_frame._evaluator._evaluator.template_program = cur_template_program
             evolve_frame._template_program_str = cur_template_program
             evolve_frame._function_to_evolve = TextFunctionProgramConverter.text_to_function(cur_template_program)
             evolve_frame._template_program = TextFunctionProgramConverter.text_to_program(cur_template_program)
-            evolve_frame._use_adj_prev_operator = self.use_adj_prev_operator and neighbor_context["prev_method_name"] is not None
-            evolve_frame._use_adj_next_operator = self.use_adj_next_operator and neighbor_context["next_method_name"] is not None
+            evolve_frame._use_adj_prev_operator = self.use_adj_prev_operator and neighbor_context["prev_name"] is not None
+            evolve_frame._use_adj_next_operator = self.use_adj_next_operator and neighbor_context["next_name"] is not None
             evolve_frame._used_operator_history = []
             evolve_frame._resume_mode = True
             evolve_frame._max_sample_nums = evolve_frame._tot_sample_nums + method_budget
@@ -724,19 +780,7 @@ class Inner:
                 valid_sample_scores=evolve_frame._sample_score_history[history_start:],
                 round_start_score=round_start_score,
             )
-        if not success or len(evolve_frame._population) == 0:
-            if population_snapshot is not None:
-                evolve_frame._population.restore(population_snapshot)
-            return None, evolve_frame, actual_sample_count
-        if population_snapshot is not None and evolve_frame._population.generation == population_snapshot["generation"]:
-            evolve_frame._population.restore(population_snapshot)
-            return None, evolve_frame, actual_sample_count
-        best_population = evolve_frame._population.population or evolve_frame._population._population
-        if not best_population:
-            if population_snapshot is not None:
-                evolve_frame._population.restore(population_snapshot)
-            return None, evolve_frame, actual_sample_count
-        best_func = best_population[0]
+        best_func = evolve_frame._population.population[0]
         self.replace(cur_method, best_func)
         return best_func, evolve_frame, actual_sample_count
     
@@ -751,40 +795,14 @@ class Inner:
             score_before = self.algorithm_frame.score
             template_program = build_template_program(self.algorithm_frame, method)
             best_func, evolve_frame, actual_sample_count = self.evolve_once(method, template_program, budget)
-            self.remaining_budget -= budget
-            self.total_consumed_budget += budget
-            self.total_consumed_samples += actual_sample_count
-            if best_func is None:
-                self._update_method_stats(
-                    method,
-                    actual_sample_count,
-                    self.algorithm_frame.score,
-                    float("-inf"),
-                    getattr(evolve_frame, "_used_operator_history", []),
-                )
-                self._record_method_step(method, budget, actual_sample_count, score_before, self.algorithm_frame.score, float("-inf"), getattr(evolve_frame, "_used_operator_history", []), {})
-                continue
-            score_after = best_func.score
-            self.algorithm_frame.score = score_after
-            gain = self._calculate_gain(score_before, score_after)
-            benefit_gain = self._calculate_benefit_gain(score_before, score_after)
-            self._update_method_stats(
-                method,
-                actual_sample_count,
-                score_after,
-                gain,
-                getattr(evolve_frame, "_used_operator_history", []),
-                benefit_gain,
-            )
-            self._record_method_step(
+            self._finalize_method_round(
                 method,
                 budget,
                 actual_sample_count,
                 score_before,
-                score_after,
-                gain,
-                getattr(evolve_frame, "_used_operator_history", []),
+                evolve_frame,
                 {},
+                best_func,
             )
 
     def _run_adaptive_schedule(self):
@@ -798,35 +816,14 @@ class Inner:
             template_program = build_template_program(self.algorithm_frame, method)
             score_before = self.algorithm_frame.score
             best_func, evolve_frame, actual_sample_count = self.evolve_once(method, template_program, budget)
-            self.remaining_budget -= budget
-            self.total_consumed_budget += budget
-            self.total_consumed_samples += actual_sample_count
-            if best_func is not None:
-                score_after = best_func.score
-                self.algorithm_frame.score = score_after
-                gain = self._calculate_gain(score_before, score_after)
-                benefit_gain = self._calculate_benefit_gain(score_before, score_after)
-            else:
-                score_after = self.algorithm_frame.score
-                gain = float("-inf")
-                benefit_gain = None
-            self._update_method_stats(
-                method,
-                actual_sample_count,
-                score_after,
-                gain,
-                getattr(evolve_frame, "_used_operator_history", []),
-                benefit_gain,
-            )
-            self._record_method_step(
+            self._finalize_method_round(
                 method,
                 budget,
                 actual_sample_count,
                 score_before,
-                score_after,
-                gain,
-                getattr(evolve_frame, "_used_operator_history", []),
+                evolve_frame,
                 {},
+                best_func,
             )
 
         while self.remaining_budget > 0:
@@ -837,35 +834,14 @@ class Inner:
             template_program = build_template_program(self.algorithm_frame, method)
             score_before = self.algorithm_frame.score
             best_func, evolve_frame, actual_sample_count = self.evolve_once(method, template_program, budget)
-            self.remaining_budget -= budget
-            self.total_consumed_budget += budget
-            self.total_consumed_samples += actual_sample_count
-            if best_func is not None:
-                score_after = best_func.score
-                self.algorithm_frame.score = score_after
-                gain = self._calculate_gain(score_before, score_after)
-                benefit_gain = self._calculate_benefit_gain(score_before, score_after)
-            else:
-                score_after = self.algorithm_frame.score
-                gain = float("-inf")
-                benefit_gain = None
-            self._update_method_stats(
-                method,
-                actual_sample_count,
-                score_after,
-                gain,
-                getattr(evolve_frame, "_used_operator_history", []),
-                benefit_gain,
-            )
-            self._record_method_step(
+            self._finalize_method_round(
                 method,
                 budget,
                 actual_sample_count,
                 score_before,
-                score_after,
-                gain,
-                getattr(evolve_frame, "_used_operator_history", []),
+                evolve_frame,
                 benefit_map,
+                best_func,
             )
     
     def run(self):
@@ -974,7 +950,7 @@ class Outer:
         response_text = ""
         algorithm_frame = None
         try:
-            response_text = self.llm.draw_sample(prompt) if not use_exist else response1
+            response_text = self.llm.draw_sample(prompt) if not use_exist else response
             self.tot_sample_nums += 1
             algorithm_frame = text_to_algorithm(response_text)
             sample_time = time.time() - sample_start_time
@@ -1148,21 +1124,42 @@ def run_inner_only(
     max_train_resample_trials: int = 50,
     eval_num_workers: int | None = None,
 ) -> AlgorithmFrame | None:
+    """
     combo_settings = [
-        ("relative_gain", {"prev"}),
-        ("relative_gain", {"next"}),
-        ("relative_gain", {"prev", "next"}),
-        ("relative_discounted_gain", {"prev"}),
-        ("relative_discounted_gain", {"next"}),
-        ("relative_discounted_gain", {"prev", "next"}),
+        ("absolute_gain", {"prev"}, True),
+        ("absolute_gain", {"next"}, True),
+        ("absolute_gain", {"prev", "next"}, True),
+        ("relative_gain", {"prev"}, True),
+        ("relative_gain", {"next"}, True),
+        ("relative_gain", {"prev", "next"}, True),
+        ("relative_discounted_gain", {"prev"}, True),
+        ("relative_discounted_gain", {"next"}, True),
+        ("relative_discounted_gain", {"prev", "next"}, True)
     ]
+    
+    combo_settings = [
+        ("absolute_gain", {"prev"}, False),
+        ("absolute_gain", {"next"}, False),
+        ("absolute_gain", {"prev", "next"}, False),
+        ("relative_gain", {"prev"}, False),
+        ("relative_gain", {"next"}, False),
+        ("relative_gain", {"prev", "next"}, False),
+        ("relative_discounted_gain", {"prev"}, False),
+        ("relative_discounted_gain", {"next"}, False),
+        ("relative_discounted_gain", {"prev", "next"}, False)
+    ]
+    """
+    
+    combo_settings = [
+        ("absolute_gain", {"prev"}, True)]
     last_successful_frame = None
 
-    for benefit_mode, operator_mode in combo_settings:
+    for benefit_mode, operator_mode, use_context_prompt in combo_settings:
         operator_tag = "_".join(sorted(operator_mode)) if operator_mode else "none"
+        context_tag = "with_context" if use_context_prompt else "raw_prompt"
         print(
             f"Start combination: benefit_mode={benefit_mode}, "
-            f"operator_mode={operator_tag}",
+            f"operator_mode={operator_tag}, context_mode={context_tag}",
             flush=True,
         )
         try:
@@ -1183,24 +1180,25 @@ def run_inner_only(
                     train_instance=current_train_instance,
                     test_instance=test_instance,
                     algorithm_frame=algorithm_frame,
-                    eoh_log_root=f"experiment_{benefit_mode}_{operator_tag}",
+                    eoh_log_root=f"experiment_average_{context_tag}",
                     max_sample_nums=1000,
-                    pop_size=5,
-                    budget_mode="adaptive",
+                    pop_size=10,
+                    budget_mode="average",
                     benefit_mode=benefit_mode,
                     method_selection_mode="softmax",
                     per_call_budget_cap=50,
                     discount_factor=0.8,
                     softmax_temperature=1.0,
-                    use_adj_prev_operator=("prev" in operator_mode),
-                    use_adj_next_operator=("next" in operator_mode),
+                    use_adj_prev_operator=False,
+                    use_adj_next_operator=False,
+                    use_context_prompt=use_context_prompt,
                     eval_num_workers=eval_num_workers,
                 )
                 baseline_score = inner._evaluate_frame()
                 if baseline_score is None:
                     print(
                         f"Skip current train seed {train_seed + offset} for "
-                        f"{benefit_mode}/{operator_tag}: baseline score is None.",
+                        f"{benefit_mode}/{operator_tag}/{context_tag}: baseline score is None.",
                         flush=True,
                     )
                     continue
@@ -1218,14 +1216,14 @@ def run_inner_only(
             if not baseline_ready:
                 print(
                     f"Skip combination benefit_mode={benefit_mode}, "
-                    f"operator_mode={operator_tag}: failed to obtain a valid "
+                    f"operator_mode={operator_tag}, context_mode={context_tag}: failed to obtain a valid "
                     f"baseline after {max_train_resample_trials} trials.",
                     flush=True,
                 )
         except Exception as exc:
             print(
                 f"Skip combination benefit_mode={benefit_mode}, "
-                f"operator_mode={operator_tag}: {exc}",
+                f"operator_mode={operator_tag}, context_mode={context_tag}: {exc}",
                 flush=True,
             )
             traceback.print_exc()

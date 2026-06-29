@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import math
 import os
 import time
@@ -149,23 +150,50 @@ class EoH:
         self.method_usage = kwargs.get("method_usage", None)
         self.method_introduction = kwargs.get("method_introduction", None)
         self.main_stream = kwargs.get("main_stream", None)
+        self.use_context_prompt = kwargs.get("use_context_prompt", True)
         self.prev_method_individual = kwargs.get("prev_method_individual", None)
-        self.prev_method_name = kwargs.get("prev_method_name", None)
-        self.prev_method_code = kwargs.get("prev_method_code", None)
-        self.prev_method_thought = kwargs.get("prev_method_thought", None)
         self.next_method_individual = kwargs.get("next_method_individual", None)
-        self.next_method_name = kwargs.get("next_method_name", None)
-        self.next_method_code = kwargs.get("next_method_code", None)
-        self.next_method_thought = kwargs.get("next_method_thought", None)
+        self._current_best_score = None
         self._sample_score_history = []
         self._sample_order_history = []
         self._plot_sample_order_history = []
-        self._round_start_plot_orders = []
-        self._round_start_plot_scores = []
         self._used_operator_history = []
         self._keep_resources_alive = kwargs.get("keep_resources_alive", False)
         self._plot_global_offset = 0
         self._plot_round_start_local_count = 0
+
+    def _log_trace_event(self, message: str) -> None:
+        logger = getattr(self._profiler, "_logger_txt", None)
+        if logger is not None:
+            logger.info(message)
+
+    def _dump_raw_response(
+        self,
+        operator: str,
+        response: str,
+        trace_status: str,
+        trimmed_code: str | None = None,
+    ) -> None:
+        log_dir = getattr(self._profiler, "_log_dir", None)
+        if not log_dir:
+            return
+        path = os.path.join(log_dir, f'{operator}_raw_responses.json')
+        content = {
+            "sample_order": self._tot_sample_nums + 1,
+            "method_name": self.method_name,
+            "operator": operator,
+            "trace_status": trace_status,
+            "trimmed_code": trimmed_code,
+            "response": response,
+        }
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = []
+        data.append(content)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
 
     def set_plot_window(self, global_offset: int, round_start_local_count: int) -> None:
         self._plot_global_offset = global_offset
@@ -179,8 +207,12 @@ class EoH:
     def record_round_initial_best(self, score: float | None) -> None:
         if score is None or math.isinf(score):
             return
-        self._round_start_plot_orders.append(self._plot_global_offset + 1)
-        self._round_start_plot_scores.append(score)
+        self._current_best_score = score
+        self._sample_order_history.append(self._tot_sample_nums)
+        self._plot_sample_order_history.append(
+            self.get_plot_sample_order(self._tot_sample_nums)
+        )
+        self._sample_score_history.append(score)
         
     def _adjust_pop_size(self):
         # adjust population size
@@ -216,37 +248,55 @@ class EoH:
         3. Add the function to the population and register it to the profiler.
         """
         sample_start = time.time()
-        thought, func = self._sampler.get_thought_and_function(prompt)
+        analysis = self._sampler.analyze_response(prompt)
+        response = analysis["response"]
+        thought = analysis["thought"]
+        func = analysis["function"]
+        program = analysis["program"]
+        issues = analysis["issues"]
+        trimmed_code = analysis["code"]
         sample_time = time.time() - sample_start
         if thought is None or func is None:
+            trace_status = f'{operator}:failed_' + '+'.join(issues or ["unknown"])
+            self._dump_raw_response(operator, response, trace_status, trimmed_code)
+            self._log_trace_event(trace_status)
             return
-        # convert to Program instance
-        program = TextFunctionProgramConverter.function_to_program(func, self._template_program)
         if program is None:
+            trace_status = f'{operator}:failed_program_convert'
+            self._dump_raw_response(operator, response, trace_status, trimmed_code)
+            self._log_trace_event(trace_status)
             return
         # evaluate
         score, eval_time = self._evaluation_executor.submit(
             self._evaluator.evaluate_program_record_time,
             program
         ).result()
+        is_valid_score = score is not None and not math.isinf(score) and score <= 0
+        if score is None or math.isinf(score) or score > 0:
+            score = None
         # register to profiler
         func.score = score
         func.evaluate_time = eval_time
         func.algorithm = thought
         func.sample_time = sample_time
         func.operator = operator
+        func.trace_status = f'{operator}:valid_score' if is_valid_score else f'{operator}:invalid_score'
+        self._dump_raw_response(operator, response, func.trace_status, trimmed_code)
         self._used_operator_history.append(operator)
-        if score is not None and not math.isinf(score) and score <= 0:
-            local_order = self._tot_sample_nums + 1
-            self._sample_order_history.append(local_order)
-            self._plot_sample_order_history.append(
-                self.get_plot_sample_order(local_order)
-            )
-            self._sample_score_history.append(score)
         if self._profiler is not None:
             self._profiler.register_function(func, program=str(program))
             if isinstance(self._profiler, EoHProfiler):
                 self._profiler.register_population(self._population)
+        local_order = self._tot_sample_nums + 1
+        if score is not None and score <= 0:
+            if self._current_best_score is None or score > self._current_best_score:
+                self._current_best_score = score
+        if self._current_best_score is not None:
+            self._sample_order_history.append(local_order)
+            self._plot_sample_order_history.append(
+                self.get_plot_sample_order(local_order)
+            )
+            self._sample_score_history.append(self._current_best_score)
         self._tot_sample_nums += 1
 
         # register to the population
@@ -262,25 +312,11 @@ class EoH:
             import matplotlib.pyplot as plt
             from matplotlib.ticker import MaxNLocator
 
-            plot_points = list(zip(self._round_start_plot_orders, self._round_start_plot_scores))
-            plot_points.extend(zip(self._plot_sample_order_history, self._sample_score_history))
-            if not plot_points:
-                return
-            plot_points.sort(key=lambda item: item[0])
-
-            plot_orders = []
-            best_so_far = []
-            current_best = float('-inf')
-            for order, score in plot_points:
-                current_best = max(current_best, score)
-                plot_orders.append(order)
-                best_so_far.append(current_best)
-
             plt.figure(figsize=(8, 5))
-            plt.plot(plot_orders, best_so_far, marker='o')
+            plt.plot(self._plot_sample_order_history, self._sample_score_history, marker='o')
             plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
             plt.xlabel('Sample Order')
-            plt.ylabel('Best Score So Far')
+            plt.ylabel('Current Best Score')
             plt.title(f'EoH Best Score Curve - {self.method_name}')
             plt.grid(True, alpha=0.3)
             plt.tight_layout()
@@ -309,7 +345,7 @@ class EoH:
                 indivs = [self._population.selection() for _ in range(self._selection_num)]
                 prompt = EoHPrompt.get_prompt_e1(self._task_description_str, indivs, self._function_to_evolve, 
                                                  self.method_name, self.method_usage, self.method_introduction,
-                                                 self.main_stream)
+                                                 self.main_stream, self.use_context_prompt)
                 if self._debug_mode:
                     print(f'E1 Prompt: {prompt}')
                 self._sample_evaluate_register(prompt, 'e1')
@@ -321,7 +357,7 @@ class EoH:
                     indivs = [self._population.selection() for _ in range(self._selection_num)]
                     prompt = EoHPrompt.get_prompt_e2(self._task_description_str, indivs, self._function_to_evolve, 
                                                      self.method_name, self.method_usage, self.method_introduction,
-                                                     self.main_stream)
+                                                     self.main_stream, self.use_context_prompt)
                     if self._debug_mode:
                         print(f'E2 Prompt: {prompt}')
                     self._sample_evaluate_register(prompt, 'e2')
@@ -333,7 +369,7 @@ class EoH:
                     indiv = self._population.selection()
                     prompt = EoHPrompt.get_prompt_m1(self._task_description_str, indiv, self._function_to_evolve, 
                                                      self.method_name, self.method_usage, self.method_introduction,
-                                                     self.main_stream)
+                                                     self.main_stream, self.use_context_prompt)
                     if self._debug_mode:
                         print(f'M1 Prompt: {prompt}')
                     self._sample_evaluate_register(prompt, 'm1')
@@ -345,7 +381,7 @@ class EoH:
                     indiv = self._population.selection()
                     prompt = EoHPrompt.get_prompt_m2(self._task_description_str, indiv, self._function_to_evolve, 
                                                      self.method_name, self.method_usage, self.method_introduction,
-                                                     self.main_stream)
+                                                     self.main_stream, self.use_context_prompt)
                     if self._debug_mode:
                         print(f'M2 Prompt: {prompt}')
                     self._sample_evaluate_register(prompt, 'm2')
@@ -363,6 +399,7 @@ class EoH:
                         self.method_usage,
                         self.method_introduction,
                         self.main_stream,
+                        self.use_context_prompt,
                     )
                     if self._debug_mode:
                         print(f'AP Prompt: {prompt}')
@@ -381,6 +418,7 @@ class EoH:
                         self.method_usage,
                         self.method_introduction,
                         self.main_stream,
+                        self.use_context_prompt,
                     )
                     if self._debug_mode:
                         print(f'AN Prompt: {prompt}')
@@ -404,7 +442,7 @@ class EoH:
                 # get a new func using i1
                 prompt = EoHPrompt.get_prompt_i1(self._task_description_str, self._function_to_evolve, 
                                                  self.method_name, self.method_usage, self.method_introduction,
-                                                 self.main_stream)
+                                                 self.main_stream, self.use_context_prompt)
                 self._sample_evaluate_register(prompt, 'i1')
                 if self._tot_sample_nums >= self._initial_sample_nums_max:
                     # print(f'Warning: Initialization not accomplished in {self._initial_sample_nums_max} samples !!!')
@@ -451,20 +489,20 @@ class EoH:
                 # do initialization
                 self._population.set_required_feasible_offspring(self._pop_size)
                 self._multi_threaded_sampling(self._iteratively_init_population)
-                self._population.survival()
-                # terminate searching if
-                if len(self._population) < self._selection_num:
+                if len(self._population) < self._pop_size:
                     print(
-                        f'The search is terminated since EoH unable to obtain {self._selection_num} feasible algorithms during initialization. '
+                        f'The search is terminated since EoH unable to obtain {self._pop_size} feasible algorithms during initialization. '
                         f'Please increase the `initial_sample_nums_max` argument (currently {self._initial_sample_nums_max}). '
                         f'Please also check your evaluation implementation and LLM implementation.')
                     return False
             else:
                 self._population.clear_pending_offspring()
-                self._population.set_required_feasible_offspring(max(1, self._pop_size - 1))
+                self._population.set_required_feasible_offspring(self._pop_size)
 
             # evolutionary search
             self._multi_threaded_sampling(self._iteratively_use_eoh_operator)
+            if self._population._next_gen_pop:
+                self._population.survival()
 
             # finish
             self._plot_convergence_curve()
