@@ -874,25 +874,29 @@ class Inner:
 class Outer:
     def __init__(self,
                  llm: HttpsApi, 
-                 instance: list[tuple[np.ndarray, float]],
+                 train_instance: list[tuple[np.ndarray, float]],
+                 test_instance: list[tuple[np.ndarray, float]] | None,
                  outer_pop_size: int,
                  outer_max_generations: int,
                  eoh_max_sample_nums: int,
                  eoh_pop_size: int,
                  timeout_seconds: int = 120,
+                 code_context_mode: str = "main_flow",
                  eval_num_workers: int | None = None):
         
         self.llm = llm
-        self.instance = instance
+        self.train_instance = train_instance
+        self.test_instance = test_instance or []
         self.max_generations = outer_max_generations
         
         self.eoh_max_sample_nums = eoh_max_sample_nums
         self.eoh_pop_size = eoh_pop_size
         self.timeout_seconds = timeout_seconds
+        self.code_context_mode = code_context_mode
         self.eval_num_workers = eval_num_workers
         
         self.population = FramePopulation(pop_size=outer_pop_size)
-        self.profiler = FrameProfiler(log_dir="logs_frame_0620")
+        self.profiler = FrameProfiler(log_dir="logs_frame_outer")
         self.eoh_log_root = os.path.join(self.profiler._log_dir, "inner_eoh")
         
         self.selection_num = 2
@@ -907,11 +911,11 @@ class Outer:
         process = mp.Process(
             target=_frame_evaluation_worker,
             args=(
-                self.instance,
+                self.train_instance,
                 algorithm_frame.body,
                 self.timeout_seconds,
                 result_queue,
-                "gap",
+                "absolute_distance",
                 self.eval_num_workers,
             ),
         )
@@ -928,6 +932,38 @@ class Outer:
         if "error" in result:
             raise RuntimeError(result["error"])
         return result["score"]
+
+    def _evaluate_test_with_timeout(self, algorithm_frame: AlgorithmFrame) -> float | None:
+        if not self.test_instance:
+            return None
+        result_queue = mp.Queue()
+        process = mp.Process(
+            target=_frame_evaluation_worker,
+            args=(
+                self.test_instance,
+                algorithm_frame.body,
+                self.timeout_seconds,
+                result_queue,
+                "gap",
+                self.eval_num_workers,
+            ),
+        )
+        process.start()
+        try:
+            result = result_queue.get(timeout=self.timeout_seconds)
+        except Empty:
+            return None
+        finally:
+            _stop_process(process)
+            result_queue.close()
+            result_queue.join_thread()
+
+        if "error" in result:
+            return None
+        score = result["score"]
+        if score is None or math.isinf(score):
+            return None
+        return score
 
     def _fill_frame_metadata(
         self,
@@ -1015,9 +1051,15 @@ class Outer:
         
     def inner_evolve(self):
         for indiv in self.population.init_population:
-            inner = Inner(llm=self.llm, train_instance=self.instance, test_instance=None, algorithm_frame=indiv,
+            inner = Inner(llm=self.llm, train_instance=self.train_instance, test_instance=None, algorithm_frame=indiv,
                           eoh_log_root=self.eoh_log_root,
                           max_sample_nums=self.eoh_max_sample_nums, pop_size=self.eoh_pop_size,
+                          budget_mode="adaptive",
+                          benefit_mode="absolute_gain",
+                          method_selection_mode="softmax",
+                          per_call_budget_cap=50,
+                          use_adj_prev_operator=True,
+                          use_adj_next_operator=True,
                           eval_num_workers=self.eval_num_workers)
             inner.run()
             if _is_valid_outer_score(inner.algorithm_frame.score):
@@ -1035,7 +1077,8 @@ class Outer:
                 prompt = FramePrompt.get_frame_prompt_e1(task_description=task_description_outer,
                                                          problem_info=problem_info,
                                                          algorithm_template=algorithm_template,
-                                                         indivs=indivs)
+                                                         indivs=indivs,
+                                                         code_context_mode=self.code_context_mode)
                 if self.debug_mode:
                     print(f"Frame Prompt (E1): {prompt}")
                 self.sample_evaluate_register(prompt, 'e1')
@@ -1048,7 +1091,8 @@ class Outer:
                     prompt = FramePrompt.get_frame_prompt_e2(task_description=task_description_outer,
                                                              problem_info=problem_info,
                                                              algorithm_template=algorithm_template,
-                                                             indivs=indivs)
+                                                             indivs=indivs,
+                                                             code_context_mode=self.code_context_mode)
                     if self.debug_mode:
                         print(f"Frame Prompt (E2): {prompt}")
                     self.sample_evaluate_register(prompt, 'e2')
@@ -1061,7 +1105,8 @@ class Outer:
                     prompt = FramePrompt.get_frame_prompt_m1(task_description=task_description_outer,
                                                              problem_info=problem_info,
                                                              algorithm_template=algorithm_template,
-                                                             indiv=indiv)
+                                                             indiv=indiv,
+                                                             code_context_mode=self.code_context_mode)
                     if self.debug_mode:
                         print(f"Frame Prompt (M1): {prompt}")
                     self.sample_evaluate_register(prompt, 'm1')
@@ -1078,10 +1123,31 @@ class Outer:
     def run(self):
         self.iteratively_init_population()
         self.inner_evolve()
-        while self.population.generation <= self.max_generations:
+        while self.population.generation < self.max_generations:
             self.frame_evolve()
             self.inner_evolve()
+        best_frame = self.population.population[0] if len(self.population.population) else None
+        if best_frame is not None:
+            test_score = self._evaluate_test_with_timeout(best_frame)
+            if test_score is not None:
+                self.profiler.register_frame(
+                    copy.deepcopy(
+                        AlgorithmFrame(
+                            score=test_score,
+                            body=best_frame.body,
+                            class_args=best_frame.class_args,
+                            method_args=best_frame.method_args,
+                            method_introduction=best_frame.method_introduction,
+                            evaluate_time=0.0,
+                            sample_time=0.0,
+                            operator="outer_final_test",
+                            frame_id=f"{best_frame.frame_id}_test",
+                            response_text=best_frame.response_text,
+                        )
+                    )
+                )
         self.profiler.finish()
+        return best_frame
 
 
 def _coords_to_distance_matrix(coords: np.ndarray) -> np.ndarray:
@@ -1151,7 +1217,8 @@ def run_inner_only(
     """
     
     combo_settings = [
-        ("absolute_gain", {"prev"}, True)]
+        ("relative_gain", {"prev"}, False),
+        ("relative_gain", {"prev"}, True)]
     last_successful_frame = None
 
     for benefit_mode, operator_mode, use_context_prompt in combo_settings:
@@ -1180,10 +1247,10 @@ def run_inner_only(
                     train_instance=current_train_instance,
                     test_instance=test_instance,
                     algorithm_frame=algorithm_frame,
-                    eoh_log_root=f"experiment_average_{context_tag}",
+                    eoh_log_root=f"experiment_{benefit_mode}_{context_tag}",
                     max_sample_nums=1000,
-                    pop_size=10,
-                    budget_mode="average",
+                    pop_size=5,
+                    budget_mode="adaptive",
                     benefit_mode=benefit_mode,
                     method_selection_mode="softmax",
                     per_call_budget_cap=50,
@@ -1231,12 +1298,13 @@ def run_inner_only(
     return last_successful_frame
     
 def main() -> None:
-    mode = "inner_only"
+    mode = "outer"
     train_city_num = 100
     train_num_instances = 50
     train_seed = 0
     test_max_city_num = 100
     eval_num_workers = 20
+    outer_code_context_mode = "full_code"
     train_instance = build_random_train_instances(train_num_instances, train_city_num, seed=train_seed)
     test_instance = build_npz_test_instances(test_max_city_num)
 
@@ -1260,11 +1328,13 @@ def main() -> None:
         return
 
     outer = Outer(llm=llm, 
-                  instance=test_instance, 
+                  train_instance=train_instance,
+                  test_instance=test_instance,
                   outer_pop_size=5, 
                   outer_max_generations=10,
                   eoh_max_sample_nums=100,
                   eoh_pop_size=10,
+                  code_context_mode=outer_code_context_mode,
                   eval_num_workers=eval_num_workers)
     outer.run()
 if __name__ == "__main__":

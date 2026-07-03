@@ -76,6 +76,31 @@ class AlgorithmFrame:
             "Class_args:\n"
             f"{class_args_lines}\n"
         )
+
+    def full_code_description(self):
+        method_lines = "\n".join(
+            f"- {name}: {intro}" for name, intro in self.method_introduction.items()
+        )
+        class_args_lines = "\n".join(self.class_args)
+        return (
+            "full_code:\n"
+            "```python\n"
+            f"{self.body.rstrip()}\n"
+            "```\n\n"
+            "method_introduction:\n"
+            f"{method_lines}\n\n"
+            "Class_args:\n"
+            f"{class_args_lines}\n"
+        )
+
+    def prompt_description(self, code_context_mode: str = "main_flow"):
+        if code_context_mode == "full_code":
+            return self.full_code_description()
+        if code_context_mode != "main_flow":
+            raise ValueError(
+                "code_context_mode must be either 'main_flow' or 'full_code'."
+            )
+        return self.description()
         
 class FramePopulation:
     def __init__(self, 

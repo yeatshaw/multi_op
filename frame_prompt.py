@@ -31,10 +31,14 @@ Do not give additional explanations.
                             problem_info: str,
                             algorithm_template: str,
                             indivs: list[dict[str, object]],
+                            code_context_mode: str = "main_flow",
                             ) -> str:
         indivs_prompt = ''
         for i, indiv in enumerate(indivs):
-            indivs_prompt += f'Algorithm {i + 1}\'s main workflow and related information are as follows:\n{indiv.description()}\n'
+            indivs_prompt += (
+                f'Algorithm {i + 1}\'s {code_context_mode} and related information are as follows:\n'
+                f'{indiv.prompt_description(code_context_mode)}\n'
+            )
         return f'''{task_description}
 I have {len(indivs)} existing algorithms with their codes as follows: {indivs_prompt}
 Please help me create a new algorithm that has a totally different main workflow from the given ones. 
@@ -62,10 +66,14 @@ Do not give additional explanations.
                             problem_info: str,
                             algorithm_template: str,
                             indivs: list[dict[str, object]],
+                            code_context_mode: str = "main_flow",
                             ) -> str:
         indivs_prompt = ''
         for i, indiv in enumerate(indivs):
-            indivs_prompt += f'Algorithm {i + 1}\'s main workflow and related information are as follows:\n{indiv.description()}\n'
+            indivs_prompt += (
+                f'Algorithm {i + 1}\'s {code_context_mode} and related information are as follows:\n'
+                f'{indiv.prompt_description(code_context_mode)}\n'
+            )
         return f'''{task_description}
 I have {len(indivs)} existing algorithms with their codes as follows:
 [{indivs_prompt}]
@@ -94,10 +102,11 @@ Do not give additional explanations.
                             problem_info: str,
                             algorithm_template: str,
                             indiv: dict[str, object],
+                            code_context_mode: str = "main_flow",
                             ) -> str:
         return f'''{task_description}
 I have one algorithm with its main workflow and related information are as follows:
-[{indiv.description()}]
+[{indiv.prompt_description(code_context_mode)}]
 Please assist me in creating a new algorithm that has a different main workflow but can be a modified version of the algorithm provided.
 
 This is the template for the content you need to output:

@@ -177,7 +177,7 @@ class EoH:
         log_dir = getattr(self._profiler, "_log_dir", None)
         if not log_dir:
             return
-        path = os.path.join(log_dir, f'{operator}_raw_responses.json')
+        path = os.path.join(log_dir, f'{operator}_raw_responses.jsonl')
         content = {
             "sample_order": self._tot_sample_nums + 1,
             "method_name": self.method_name,
@@ -186,14 +186,8 @@ class EoH:
             "trimmed_code": trimmed_code,
             "response": response,
         }
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            data = []
-        data.append(content)
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(content, ensure_ascii=False) + '\n')
 
     def set_plot_window(self, global_offset: int, round_start_local_count: int) -> None:
         self._plot_global_offset = global_offset
